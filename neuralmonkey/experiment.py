@@ -28,7 +28,7 @@ from neuralmonkey.runners.base_runner import ExecutionResult
 
 _TRAIN_ARGS = [
     "val_dataset", "trainer", "name", "train_dataset", "epochs",
-    "initial_variables", "validation_period",
+    "test_datasets", "initial_variables", "validation_period",
     "val_preview_input_series", "val_preview_output_series",
     "val_preview_num_examples", "logging_period", "visualize_embeddings",
     "random_seed", "overwrite_output_dir"
@@ -352,6 +352,7 @@ def create_config(train_mode: bool = True) -> Configuration:
         config.add_argument("train_dataset")
         config.add_argument("val_dataset", required=False, default=[])
         config.add_argument("evaluation")
+        config.add_argument("test_datasets", required=False, default=[])
         config.add_argument("logging_period", required=False, default=20)
         config.add_argument("validation_period", required=False, default=500)
         config.add_argument("visualize_embeddings", required=False,

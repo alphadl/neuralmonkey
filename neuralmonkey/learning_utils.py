@@ -192,6 +192,21 @@ def training_loop(cfg: Namespace) -> None:
         .format(cfg.main_metric, cfg.tf_manager.best_score,
                 cfg.tf_manager.best_score_epoch))
 
+    if cfg.test_datasets:
+        cfg.tf_manager.restore_best_vars()
+
+        for dataset in cfg.test_datasets:
+            test_results, test_outputs = run_on_dataset(
+                cfg.tf_manager, cfg.runners, dataset, cfg.postprocess,
+                write_out=True, batching_scheme=cfg.runners_batching_scheme)
+            # ensure test outputs are iterable more than once
+            test_outputs = {k: list(v) for k, v in test_outputs.items()}
+            eval_result = evaluation(cfg.evaluation, dataset, cfg.runners,
+                                     test_results, test_outputs)
+            print_final_evaluation(dataset.name, eval_result)
+
+    log("Finished.")
+
     if interrupt is not None:
         raise interrupt  # pylint: disable=raising-bad-type
 

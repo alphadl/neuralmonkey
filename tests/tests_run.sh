@@ -26,7 +26,7 @@ bin/neuralmonkey-train tests/transformer.ini
 # Testing environment variable substitution in config file
 NM_EXPERIMENT_NAME=small bin/neuralmonkey-train tests/small.ini
 export NM_EXPERIMENT_NAME='"small"'
-bin/neuralmonkey-run tests/small.ini tests/test_data_no_target.ini
+bin/neuralmonkey-run tests/small.ini tests/test_data.ini
 bin/neuralmonkey-run tests/small.ini tests/test_data.ini --json /dev/stdout \
     | python -c 'import sys,json; print(json.load(sys.stdin)[0]["target/bleu"])'
 unset NM_EXPERIMENT_NAME
