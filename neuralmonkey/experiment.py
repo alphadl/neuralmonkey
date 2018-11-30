@@ -120,6 +120,15 @@ class Experiment:
             debug("Runner fetches: {}".format(runner.fetches))
         log("TF Graph built")
 
+    def register_inputs(self) -> None:
+        feedables = set.union(*[ex.feedables for ex in self.model.runners])
+        if self.train_mode:
+            feedables |= set.union(
+                *[ex.feedables for ex in self.model.trainers])
+
+        for feedable in feedables:
+            feedable.register_input()
+
     def build_model(self) -> None:
         if self._model_built:
             raise RuntimeError("build_model() called twice")
@@ -138,6 +147,9 @@ class Experiment:
 
             self._model = self.config.model
             self._model_built = True
+
+            # build dataset
+            self.register_inputs()
 
             self._bless_graph_executors()
             self.model.tf_manager.initialize_sessions()
