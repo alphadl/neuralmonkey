@@ -45,7 +45,6 @@ def training_loop(tf_manager: TensorFlowManager,
                   runners: List[BaseRunner],
                   train_dataset: Dataset,
                   val_datasets: List[Dataset],
-                  test_datasets: Optional[List[Dataset]],
                   log_timer: Callable[[int, float], bool],
                   val_timer: Callable[[int, float], bool],
                   val_preview_input_series: Optional[List[str]],
@@ -79,7 +78,6 @@ def training_loop(tf_manager: TensorFlowManager,
             The last dataset is used as the main one for storing best results.
             When using multiple datasets. It is recommended to name them for
             better Tensorboard visualization.
-        test_datasets: List of datasets used for testing
         logging_period: after how many batches should the logging happen. It
             can also be defined as a time period in format like: 3s; 4m; 6h;
             1d; 3m15s; 3seconds; 4minutes; 6hours; 1days
@@ -266,19 +264,6 @@ def training_loop(tf_manager: TensorFlowManager,
 
     log("Saving final variables in {}".format(final_variables))
     tf_manager.save(final_variables)
-
-    if test_datasets:
-        tf_manager.restore_best_vars()
-
-        for dataset in test_datasets:
-            test_results, test_outputs = run_on_dataset(
-                tf_manager, runners, dataset, postprocess,
-                write_out=True, batching_scheme=runners_batching_scheme)
-            # ensure test outputs are iterable more than once
-            test_outputs = {k: list(v) for k, v in test_outputs.items()}
-            eval_result = evaluation(evaluators, dataset, runners,
-                                     test_results, test_outputs)
-            print_final_evaluation(dataset.name, eval_result)
 
     log("Finished.")
 
