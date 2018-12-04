@@ -106,6 +106,7 @@ class ReinforceObjective(Objective[Decoder]):
                     if token in (END_TOKEN, PAD_TOKEN):
                         break
                     hyp_seq.append(token)
+
                 # join BPEs, split on " " to prepare list for evaluator
                 refs_tokens = " ".join(ref_seq).replace("@@ ", "").split(" ")
                 hyps_tokens = " ".join(hyp_seq).replace("@@ ", "").split(" ")
