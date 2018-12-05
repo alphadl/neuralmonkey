@@ -160,8 +160,8 @@ class Experiment:
                          for d in test_datasets]
 
             # Add preprocessed series among types
-            input_types = test_data.output_types
-            input_shapes = test_data.output_shapes
+            input_types = test_data[0].output_types
+            input_shapes = test_data[0].output_shapes
 
         # string handles
         self.handle = tf.placeholder(tf.string, shape=[])

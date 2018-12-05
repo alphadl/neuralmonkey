@@ -77,7 +77,6 @@ KEEP = "<keep>"
 DELETE = "<delete>"
 
 
-# TODO(tf-data) convert this function to work with tensors
 def convert_to_edits(source: List[str], target: List[str]) -> List[str]:
     lev = np.zeros([len(source) + 1, len(target) + 1])
     edits = [[[] for _ in range(len(target) + 1)]

@@ -12,7 +12,7 @@ def bpe_preprocess(
         merge_file: str,
         separator: str = "@@",
         encoding: str = "utf-8") -> Callable[[tf.Tensor], tf.Tensor]:
-    """Wrapper function for Byte-Pair Encoding.
+    """Get preprocess function for Byte-Pair Encoding.
 
     Paper: https://arxiv.org/abs/1508.07909
     Code: https://github.com/rsennrich/subword-nmt

@@ -439,17 +439,11 @@ class Dataset:
         shapes = dataset.output_shapes
 
         # TODO(tf-data)
-        # Adding end symbols should be handled here (if we want to preserve
-        # the original behavior)
-        # Adding start symbols should be done after the call to padded_batch
-        # But this can be subject to change.
-
-        # TODO(tf-data)
         # Set num_parallel_calls everywhere possible according to
         # tf_manager.num_threads
 
         def make_zero(t):
-            """Adapted from TF dataset_ops"""
+            """Adapted from TF dataset_ops."""
             if t.base_dtype == tf.string:
                 return PAD_TOKEN
             if t.base_dtype == tf.variant:
