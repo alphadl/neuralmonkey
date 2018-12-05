@@ -19,7 +19,6 @@ from tensorflow.python import debug as tf_debug
 from typeguard import check_argument_types
 
 from neuralmonkey.logging import log
-from neuralmonkey.dataset import Dataset
 from neuralmonkey.model.feedable import Feedable
 from neuralmonkey.runners.base_runner import (
     FeedDict, ExecutionResult, GraphExecutor)
@@ -187,7 +186,7 @@ class TensorFlowManager:
 
     # pylint: disable=too-many-locals
     def execute(self,
-                batch: Dataset,
+                data_handle: FeedDict,
                 feedables: Set[Feedable],
                 runners: Sequence[GraphExecutor],
                 train: bool = False,
@@ -212,7 +211,8 @@ class TensorFlowManager:
             A list of `ExecutionResult` tuples, one for each executable
             (runner).
         """
-        default_feed_dict = _feed_dicts(batch, feedables, train=train)
+        default_feed_dict = _feed_dicts(feedables, train=train)
+        default_feed_dict.update(data_handle)
 
         executables = [runner.get_executable(compute_losses=compute_losses,
                                              summaries=summaries,
@@ -294,16 +294,16 @@ class TensorFlowManager:
             self.save(self.variables_files[0])
 
 
-def _feed_dicts(dataset: Dataset, coders: Set[Feedable], train: bool = False):
+def _feed_dicts(coders: Set[Feedable], train: bool = False):
     """Feed the coders with data from dataset.
 
-    This function ensures all encoder and decoder objects feed their the data
-    they need from the dataset.
+    This function ensures all feedables run their `feed_dict` method with the
+    provided `train` flag.
     """
     res = {}
 
     for coder in coders:
-        res.update(coder.feed_dict(dataset, train=train))
+        res.update(coder.feed_dict(train=train))
 
     return res
 

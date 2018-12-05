@@ -1,18 +1,65 @@
 from typing import Callable, Iterable, List
 import os
-from typeguard import check_argument_types
+
 import numpy as np
+import tensorflow as tf
+from typeguard import check_argument_types
 from PIL import Image, ImageFile
+
+from neuralmonkey.logging import warn
+
+
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 def image_reader(pad_w: int,
                  pad_h: int,
+                 channels: int,
                  prefix: str = "",
                  rescale_w: bool = False,
                  rescale_h: bool = False,
                  keep_aspect_ratio: bool = False,
-                 mode: str = "RGB") -> Callable:
+                 mode: str = "RGB") -> Callable[[List[str]], tf.data.Dataset]:
+
+    gen = py_image_reader(pad_w, pad_h, channels, prefix, rescale_w, rescale_h,
+                          keep_aspect_ratio, mode)
+
+    def reader(files: List[str]) -> tf.data.Dataset:
+        return tf.data.Dataset.from_generator(
+            lambda: gen(files),
+            output_types=tf.float32,
+            output_shapes=tf.TensorShape([pad_w, pad_h, channels]))
+
+    return reader
+
+
+def imagenet_reader(prefix: str,
+                    target_width: int = 227,
+                    target_height: int = 227,
+                    vgg_normalization: bool = False,
+                    zero_one_normalization: bool = False) -> Callable[
+                        [List[str]], tf.data.Dataset]:
+
+    gen = py_imagenet_reader(prefix, target_width, target_height,
+                             vgg_normalization, zero_one_normalization)
+
+    def reader(files: List[str]) -> tf.data.Dataset:
+        return tf.data.Dataset.from_generator(
+            lambda: gen(files),
+            output_types=tf.float32,
+            output_shapes=tf.TensorShape([target_height, target_width, 3]))
+
+    return reader
+
+
+def py_image_reader(pad_w: int,
+                    pad_h: int,
+                    channels: int,
+                    prefix: str = "",
+                    rescale_w: bool = False,
+                    rescale_h: bool = False,
+                    keep_aspect_ratio: bool = False,
+                    mode: str = "RGB") -> Callable:
     """Get a reader of images loading them from a list of pahts.
 
     Args:
@@ -57,23 +104,33 @@ def image_reader(pad_w: int,
                     try:
                         image = Image.open(path).convert(mode)
                     except IOError:
+                        warn("Skipping image from file '{}' no. '{}'.".format(
+                            path, i + 1))
                         image = Image.new(mode, (pad_w, pad_h))
 
                     image = _rescale_or_crop(image, pad_w, pad_h,
                                              rescale_w, rescale_h,
                                              keep_aspect_ratio)
-                    image_np = np.array(image)
+
+                    # converting image to np.array switches width and height
+                    image_np = np.swapaxes(np.array(image), 0, 1)
 
                     if len(image_np.shape) == 2:
-                        channels = 1
+                        img_channels = 1
                         image_np = np.expand_dims(image_np, 2)
                     elif len(image_np.shape) == 3:
-                        channels = image_np.shape[2]
+                        img_channels = image_np.shape[2]
                     else:
                         raise ValueError(
                             ("Image should have either 2 (black and white) "
                              "or three dimensions (color channels), has {} "
                              "dimension.").format(len(image_np.shape)))
+
+                    if channels != img_channels:
+                        raise ValueError(
+                            "Image does not have the pre-declared number of "
+                            "channels {}, but {}.".format(
+                                channels, img_channels))
 
                     yield _pad(image_np, pad_w, pad_h, channels)
 
@@ -84,11 +141,11 @@ def image_reader(pad_w: int,
 VGG_RGB_MEANS = [[[123.68, 116.779, 103.939]]]
 
 
-def imagenet_reader(prefix: str,
-                    target_width: int = 227,
-                    target_height: int = 227,
-                    vgg_normalization: bool = False,
-                    zero_one_normalization: bool = False) -> Callable:
+def py_imagenet_reader(prefix: str,
+                       target_width: int = 227,
+                       target_height: int = 227,
+                       vgg_normalization: bool = False,
+                       zero_one_normalization: bool = False) -> Callable:
     """Load and prepare image the same way as Caffe scripts.
 
     The image preprocessing first rescales the image such that smaller edge has
@@ -150,7 +207,7 @@ def single_image_for_imagenet(
             True, True, False)
     cropped_image = _crop(image, target_width, target_height)
 
-    res = _pad(np.array(cropped_image),
+    res = _pad(np.swapaxes(np.array(cropped_image), 0, 1),
                target_width, target_height, 3)
     assert res.shape == (target_width, target_height, 3)
 
@@ -203,9 +260,9 @@ def _crop(image: Image.Image, pad_w: int, pad_h: int) -> Image.Image:
 
 def _pad(image: np.ndarray, pad_w: int, pad_h: int,
          channels: int) -> np.ndarray:
-    img_h, img_w = image.shape[:2]
+    img_w, img_h = image.shape[:2]
 
-    image_padded = np.zeros((pad_h, pad_w, channels))
-    image_padded[:img_h, :img_w, :] = image
+    image_padded = np.zeros((pad_w, pad_h, channels))
+    image_padded[:img_w, :img_h, :] = image
 
     return image_padded

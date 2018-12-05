@@ -13,10 +13,11 @@ import tensorflow as tf
 from termcolor import colored
 
 from neuralmonkey.logging import log, log_print, warn
-from neuralmonkey.dataset import Dataset, BatchingScheme
+from neuralmonkey.dataset import Dataset
 from neuralmonkey.tf_manager import TensorFlowManager
 from neuralmonkey.runners.base_runner import (
-    BaseRunner, ExecutionResult, reduce_execution_results, GraphExecutor)
+    BaseRunner, ExecutionResult, reduce_execution_results, FeedDict,
+    GraphExecutor)
 from neuralmonkey.runners.dataset_runner import DatasetRunner
 from neuralmonkey.trainers.generic_trainer import GenericTrainer
 from neuralmonkey.trainers.multitask_trainer import MultitaskTrainer
@@ -64,128 +65,151 @@ def training_loop(cfg: Namespace) -> None:
     last_seen_instances = 0
     interrupt = None
 
+    sess = cfg.tf_manager.sessions[0]
+
+    from neuralmonkey.experiment import Experiment
+    exp = Experiment.get_current()
+
+    train_it = exp.train_it
+    val_its = exp.val_its
+    tst_its = exp.tst_its
+    train_handle = exp.train_handle
+    val_handles = exp.val_handles
+    test_handles = exp.test_handles
+    handle = exp.handle
+
     try:
         for epoch_n in range(1, cfg.epochs + 1):
-            train_batches = cfg.train_dataset.batches(cfg.batching_scheme)
 
-            if epoch_n == 1 and cfg.train_start_offset:
-                if cfg.train_dataset.shuffled and not cfg.train_dataset.lazy:
-                    warn("Not skipping training instances with shuffled "
-                         "non-lazy dataset")
-                else:
-                    _skip_lines(cfg.train_start_offset, train_batches)
+            sess.run(train_it.initializer)
+
+            # TODO(tf-data) skip train_start_offset
+            batch_n = 0
 
             log_print("")
             log("Epoch {} begins".format(epoch_n), color="red")
             profiler.epoch_start()
 
-            for batch_n, batch in enumerate(train_batches):
-                step += 1
-                seen_instances += len(batch)
+            while True:
+                try:
+                    batch_n += 1
+                    step += 1
 
-                if cfg.log_timer(step, profiler.last_log_time):
-                    trainer_result = cfg.tf_manager.execute(
-                        batch, feedables, cfg.trainers, train=True,
-                        summaries=True)
-                    train_results, train_outputs, f_batch = run_on_dataset(
-                        cfg.tf_manager, cfg.runners, cfg.dataset_runner, batch,
-                        cfg.postprocess, write_out=False,
-                        batching_scheme=cfg.runners_batching_scheme)
-                    # ensure train outputs are iterable more than once
-                    train_outputs = {
-                        k: list(v) for k, v in train_outputs.items()}
-                    train_evaluation = evaluation(
-                        cfg.evaluation, f_batch, cfg.runners, train_results,
-                        train_outputs)
+                    # TODO(tf-data) tohle je nepresny!
+                    seen_instances += 1
 
-                    _log_continuous_evaluation(
-                        tb_writer, cfg.main_metric, train_evaluation,
-                        seen_instances, epoch_n, cfg.epochs, trainer_result,
-                        train=True)
-
-                    profiler.log_done()
-
-                else:
-                    cfg.tf_manager.execute(
-                        batch, feedables, cfg.trainers, train=True,
-                        summaries=False)
-
-                if cfg.val_timer(step, profiler.last_val_time):
-
-                    log_print("")
-                    profiler.validation_start()
-
-                    val_examples = 0
-                    for val_id, valset in enumerate(cfg.val_datasets):
-                        val_examples += len(valset)
-
-                        val_results, val_outputs, f_valset = run_on_dataset(
+                    if cfg.log_timer(step, profiler.last_log_time):
+                        trainer_result = cfg.tf_manager.execute(
+                            {handle: train_handle},
+                            feedables, cfg.trainers, train=True, summaries=True)
+                        train_results, train_outputs, f_batch = run_on_dataset(
                             cfg.tf_manager, cfg.runners, cfg.dataset_runner,
-                            valset, cfg.postprocess, write_out=False,
-                            batching_scheme=cfg.runners_batching_scheme)
-                        # ensure val outputs are iterable more than once
-                        val_outputs = {k: list(v)
-                                       for k, v in val_outputs.items()}
-                        val_evaluation = evaluation(
-                            cfg.evaluation, f_valset, cfg.runners, val_results,
-                            val_outputs)
+                            {handle: train_handle}, cfg.postprocess,
+                            write_out=False, compute_losses=True,
+                            single_batch=True)
 
-                        valheader = ("Validation (epoch {}, batch number {}):"
-                                     .format(epoch_n, batch_n))
-                        log(valheader, color="blue")
-                        _print_examples(
-                            f_valset, val_outputs,
-                            cfg.val_preview_input_series,
-                            cfg.val_preview_output_series,
-                            cfg.val_preview_num_examples)
+                        # ensure train outputs are iterable more than once
+                        train_outputs = {
+                            k: list(v) for k, v in train_outputs.items()}
+
+                        train_evaluation = evaluation(
+                            cfg.evaluation, f_batch, cfg.runners,
+                            train_results, train_outputs)
+
+                        _log_continuous_evaluation(
+                            tb_writer, cfg.main_metric, train_evaluation,
+                            seen_instances, epoch_n, cfg.epochs, trainer_result,
+                            train=True)
+
+                        profiler.log_done()
+                    else:
+                        cfg.tf_manager.execute(
+                            {handle: train_handle},
+                            feedables, cfg.trainers, train=True,
+                            summaries=False)
+
+                    if cfg.val_timer(step, profiler.last_val_time):
                         log_print("")
-                        log(valheader, color="blue")
+                        profiler.validation_start()
+                        val_examples = 0
 
-                        # The last validation set is selected to be the main
-                        if val_id == len(cfg.val_datasets) - 1:
-                            this_score = val_evaluation[cfg.main_metric]
-                            cfg.tf_manager.validation_hook(this_score, epoch_n,
+                        sess.run([v.initializer for v in val_its])
+
+                        for val_id, valhand in enumerate(val_handles):
+
+                            val_results, val_outputs, f_valset = run_on_dataset(
+                                cfg.tf_manager, cfg.runners,
+                                cfg.dataset_runner, {handle: valhand},
+                                cfg.postprocess, write_out=False,
+                                compute_losses=True)
+
+                            val_examples += len(next(iter(f_valset.values())))
+                            # ensure val outputs are iterable more than once
+                            val_outputs = {k: list(v)
+                                           for k, v in val_outputs.items()}
+                            val_evaluation = evaluation(
+                                cfg.evaluation, f_valset, cfg.runners,
+                                val_results, val_outputs)
+
+                            valheader = ("Validation (epoch {}, batch number {}):"
+                                         .format(epoch_n, batch_n))
+                            log(valheader, color="blue")
+                            _print_examples(
+                                f_valset, val_outputs,
+                                cfg.val_preview_input_series,
+                                cfg.val_preview_output_series,
+                                cfg.val_preview_num_examples)
+                            log_print("")
+                            log(valheader, color="blue")
+
+                            # The last validation set is selected to be the main
+                            if val_id == len(cfg.val_datasets) - 1:
+                                this_score = val_evaluation[cfg.main_metric]
+                                cfg.tf_manager.validation_hook(this_score, epoch_n,
                                                            batch_n)
 
-                            if this_score == cfg.tf_manager.best_score:
-                                best_score_str = colored(
-                                    "{:.4g}".format(cfg.tf_manager.best_score),
-                                    attrs=["bold"])
+                                if this_score == cfg.tf_manager.best_score:
+                                    best_score_str = colored(
+                                        "{:.4g}".format(cfg.tf_manager.best_score),
+                                        attrs=["bold"])
 
-                                # store also graph parts
-                                rnrs = cfg.runners + cfg.trainers
-                                # TODO: refactor trainers/runners so that they
-                                # have the same API predecessor
-                                parameterizeds = set.union(
-                                    *[rnr.parameterizeds
-                                      for rnr in rnrs])
-                                for coder in parameterizeds:
-                                    for session in cfg.tf_manager.sessions:
-                                        coder.save(session)
-                            else:
-                                best_score_str = "{:.4g}".format(
-                                    cfg.tf_manager.best_score)
+                                    # store also graph parts
+                                    rnrs = cfg.runners + cfg.trainers  # type: ignore
+                                    # TODO: refactor cfg.trainers/cfg.runners so that they
+                                    # have the same API predecessor
+                                    parameterizeds = set.union(
+                                        *[rnr.parameterizeds
+                                          for rnr in rnrs])
+                                    for coder in parameterizeds:
+                                        for session in cfg.tf_manager.sessions:
+                                            coder.save(session)
+                                else:
+                                    best_score_str = "{:.4g}".format(
+                                        cfg.tf_manager.best_score)
 
-                            log("best {} on validation: {} (in epoch {}, "
-                                "after batch number {})"
-                                .format(cfg.main_metric, best_score_str,
-                                        cfg.tf_manager.best_score_epoch,
-                                        cfg.tf_manager.best_score_batch),
-                                color="blue")
+                                log("best {} on validation: {} (in epoch {}, "
+                                    "after batch number {})"
+                                    .format(cfg.main_metric, best_score_str,
+                                            cfg.tf_manager.best_score_epoch,
+                                            cfg.tf_manager.best_score_batch),
+                                    color="blue")
 
-                        v_name = "val_{}".format(val_id) if len(
-                            cfg.val_datasets) > 1 else None
-                        _log_continuous_evaluation(
-                            tb_writer, cfg.main_metric, val_evaluation,
-                            seen_instances, epoch_n, cfg.epochs, val_results,
-                            train=False, dataset_name=v_name)
+                            v_name = "val_{}".format(val_id) if len(
+                                cfg.val_datasets) > 1 else None
+                            _log_continuous_evaluation(
+                                tb_writer, cfg.main_metric, val_evaluation,
+                                seen_instances, epoch_n, cfg.epochs, val_results,
+                                train=False, dataset_name=v_name)
 
-                    profiler.validation_done()
-                    profiler.log_after_validation(
-                        val_examples, seen_instances - last_seen_instances)
-                    last_seen_instances = seen_instances
+                        profiler.validation_done()
+                        profiler.log_after_validation(
+                            val_examples, seen_instances - last_seen_instances)
+                        last_seen_instances = seen_instances
 
-                    log_print("")
+                        log_print("")
+
+                except tf.errors.OutOfRangeError:
+                    break
 
     except KeyboardInterrupt as ex:
         interrupt = ex
@@ -197,11 +221,13 @@ def training_loop(cfg: Namespace) -> None:
     if cfg.test_datasets:
         cfg.tf_manager.restore_best_vars()
 
-        for test_id, dataset in enumerate(cfg.test_datasets):
+        sess.run([t.initializer for t in tst_its])
+
+        for test_id, testhand in enumerate(test_handles):
             test_results, test_outputs, f_testset = run_on_dataset(
-                cfg.tf_manager, cfg.runners, cfg.dataset_runner, dataset,
-                cfg.postprocess, write_out=True,
-                batching_scheme=cfg.runners_batching_scheme)
+                cfg.tf_manager, cfg.runners, cfg.dataset_runner,
+                {handle: testhand}, cfg.postprocess, write_out=True,
+                compute_losses=True)
             # ensure test outputs are iterable more than once
             test_outputs = {k: list(v) for k, v in test_outputs.items()}
             eval_result = evaluation(cfg.evaluation, f_testset, cfg.runners,
@@ -293,11 +319,12 @@ def _check_series_collisions(runners: List[BaseRunner],
 def run_on_dataset(tf_manager: TensorFlowManager,
                    runners: List[BaseRunner],
                    dataset_runner: DatasetRunner,
-                   dataset: Dataset,
+                   dataset: FeedDict,
                    postprocess: Postprocess,
-                   batching_scheme: BatchingScheme,
                    write_out: bool = False,
-                   log_progress: int = 0) -> Tuple[
+                   log_progress: int = 0,
+                   compute_losses: bool = False,
+                   single_batch: bool = False) -> Tuple[
                        List[ExecutionResult],
                        Dict[str, List],
                        Dict[str, List]]:
@@ -316,7 +343,6 @@ def run_on_dataset(tf_manager: TensorFlowManager,
         postprocess: Dataset-level postprocessors
         write_out: Flag whether the outputs should be printed to a file defined
             in the dataset object.
-        batching_scheme: Scheme used for batching.
         log_progress: log progress every X seconds
 
         extra_fetches: Extra tensors to evaluate for each batch.
@@ -326,52 +352,60 @@ def run_on_dataset(tf_manager: TensorFlowManager,
         they are available which are dictionary function -> value.
 
     """
-    # If the dataset contains the target series, compute also losses.
-    contains_targets = all(runner.decoder_data_id in dataset
-                           for runner in runners
-                           if runner.decoder_data_id is not None)
-
     last_log_time = time.process_time()
     batch_results = [[] for _ in runners]  # type: List[List[ExecutionResult]]
-    batch_results.append([])  # For dataset runner
+    batch_results.append([])  # for dataset runner
 
     feedables = set.union(*[runner.feedables for runner in runners])
     feedables |= dataset_runner.feedables
 
     processed_examples = 0
-    for batch in dataset.batches(batching_scheme):
-        if 0 < log_progress < time.process_time() - last_log_time:
-            log("Processed {} examples.".format(processed_examples))
-            last_log_time = time.process_time()
 
-        executors = []  # type: List[GraphExecutor]
-        executors.extend(runners)
-        executors.append(dataset_runner)
+    while True:
+        try:
+            if 0 < log_progress < time.process_time() - last_log_time:
+                log("Processed {} examples.".format(processed_examples))
+                last_log_time = time.process_time()
 
-        execution_results = tf_manager.execute(
-            batch, feedables, executors, compute_losses=contains_targets)
+            executors = []  # type: List[GraphExecutor]
+            executors.extend(runners)
+            executors.append(dataset_runner)
 
-        processed_examples += len(batch)
+            execution_results = tf_manager.execute(
+                dataset, feedables, executors, compute_losses=compute_losses)
 
-        for script_list, ex_result in zip(batch_results, execution_results):
-            script_list.append(ex_result)
+            # TODO(tf-data)
+            #processed_examples += batching_scheme.batch_size  # TODO NEPRESNE
+
+            for script_list, ex_result in zip(batch_results, execution_results):
+                script_list.append(ex_result)
+
+            if single_batch:
+                break
+
+        except tf.errors.OutOfRangeError:
+            if single_batch:
+                # During training, it may happen that logging is performed
+                # just at the end of epoch. We gracefully ignore this logging
+                # step by re-raising the exception.
+                raise
+            break
 
     # Transpose runner interim results.
     all_results = [reduce_execution_results(res) for res in batch_results[:-1]]
 
-    # TODO uncomment this when dataset runner starts outputting the dataset
-    # input_transposed = reduce_execution_results(batch_results[-1]).outputs
-    # fetched_input = {
-    #     k: [dic[k] for dic in input_transposed] for k in input_transposed[0]}
+    input_transposed = reduce_execution_results(batch_results[-1]).outputs
 
-    fetched_input = {s: list(dataset.get_series(s)) for s in dataset.series}
-    fetched_input_lengths = {s: len(fetched_input[s]) for s in dataset.series}
+    fetched_input = {
+        k: [dic[k] for dic in input_transposed] for k in input_transposed[0]}
+    fetched_input_lengths = {s: len(fetched_input[s]) for s in fetched_input}
 
     if len(set(fetched_input_lengths.values())) != 1:
         warn("Fetched input dataset series are not of the same length: {}"
              .format(str(fetched_input_lengths)))
 
-    dataset_len = fetched_input_lengths[dataset.series[0]]
+    # TODO(tf-data) this does not work when series are nested
+    dataset_len = fetched_input_lengths[next(iter(fetched_input_lengths))]
 
     # Convert execution results to dictionary.
     result_data = {runner.output_series: result.outputs
@@ -389,21 +423,21 @@ def run_on_dataset(tf_manager: TensorFlowManager,
     # Check output series lengths.
     for series_id, data in result_data.items():
         if len(data) != dataset_len:
-            warn("Output '{}' for dataset '{}' has length {}, but input "
-                 "dataset size is {}".format(series_id, dataset.name,
-                                             len(data), dataset_len))
+            warn("Output '{}' has length {}, but input dataset size is {}"
+                 .format(series_id, len(data), dataset_len))
 
-    if write_out and dataset.outputs is not None:
-        for series_id, data in result_data.items():
-            if series_id in dataset.outputs:
-                path, writer = dataset.outputs[series_id]
-                writer(path, data)
-            else:
-                log("There is no file for output series '{}' in dataset: '{}'"
-                    .format(series_id, dataset.name), color="red")
-    elif write_out:
-        log("Dataset does not have any outputs, nothing to write out.",
-            color="red")
+    # TODO(tf-data)
+    # if write_out and dataset.outputs is not None:
+    #     for series_id, data in result_data.items():
+    #         if series_id in dataset.outputs:
+    #             path, writer = dataset.outputs[series_id]
+    #             writer(path, data)
+    #         else:
+    #             log("There is no file for output series '{}' in dataset: '{}'"
+    #                 .format(series_id, dataset.name), color="red")
+    # elif write_out:
+    #     log("Dataset does not have any outputs, nothing to write out.",
+    #         color="red")
 
     return all_results, result_data, fetched_input
 
@@ -436,6 +470,7 @@ def evaluation(evaluators, batch, runners, execution_results, result_data):
 
         desired_output = batch[reference_id]
         model_output = result_data[hypothesis_id]
+
         eval_result["{}/{}".format(hypothesis_id, function.name)] = function(
             model_output, desired_output)
 
@@ -523,8 +558,8 @@ def _data_item_to_str(item: Any) -> str:
     return str(item)
 
 
-def _print_examples(dataset: Dict[str, List[Any]],
-                    outputs: Dict[str, List[Any]],
+def _print_examples(dataset: Dict[str, List],
+                    outputs: Dict[str, List],
                     val_preview_input_series: Optional[List[str]] = None,
                     val_preview_output_series: Optional[List[str]] = None,
                     num_examples=15) -> None:

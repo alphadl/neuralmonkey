@@ -20,7 +20,7 @@ Runner = TypeVar("Runner", bound="BaseRunner")
 
 class ExecutionResult(NamedTuple(
         "ExecutionResult",
-        [("outputs", List[Any]),
+        [("outputs", Any),
          ("losses", List[float]),
          ("scalar_summaries", tf.Summary),
          ("histogram_summaries", tf.Summary),
@@ -31,7 +31,7 @@ class ExecutionResult(NamedTuple(
     ``self._result``.
 
     Attributes:
-        outputs: A batch of outputs of the runner.
+        outputs: A nested structure of batched outputs of the runner.
         losses: A (possibly empty) list of loss values computed during the run.
         scalar_summaries: A TensorFlow summary object with scalar values.
         histogram_summaries: A TensorFlow summary object with histograms.

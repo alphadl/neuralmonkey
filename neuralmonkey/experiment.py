@@ -15,7 +15,7 @@ from typeguard import check_argument_types
 
 from neuralmonkey.checking import (check_dataset_and_coders,
                                    CheckingException)
-from neuralmonkey.dataset import BatchingScheme, Dataset
+from neuralmonkey.dataset import Dataset
 from neuralmonkey.logging import Logging, log, debug, warn
 from neuralmonkey.config.configuration import Configuration
 from neuralmonkey.config.disambiguate import disambiguate_configuration
@@ -23,7 +23,7 @@ from neuralmonkey.learning_utils import (training_loop, evaluation,
                                          run_on_dataset,
                                          print_final_evaluation)
 from neuralmonkey.model.sequence import EmbeddedFactorSequence
-from neuralmonkey.runners.base_runner import ExecutionResult
+from neuralmonkey.runners.base_runner import ExecutionResult, FeedDict
 from neuralmonkey.runners.dataset_runner import DatasetRunner
 
 
@@ -40,6 +40,8 @@ _EXPERIMENT_FILES = ["experiment.log", "experiment.ini", "original.ini",
                      "git_commit", "git_diff", "variables.data.best"]
 
 
+# pylint: disable=too-many-instance-attributes
+# TODO(tf-data) make some getters
 class Experiment:
     # pylint: disable=no-member
 
@@ -121,18 +123,71 @@ class Experiment:
             debug("Runner fetches: {}".format(runner.fetches))
         log("TF Graph built")
 
-    def register_inputs(self) -> None:
+    def register_inputs(self, test_datasets: List[Dataset] = None) -> None:
+        log("Initializing TF dataset")
+
         feedables = set.union(*[ex.feedables for ex in self.model.runners])
         if self.train_mode:
             feedables |= set.union(
                 *[ex.feedables for ex in self.model.trainers])
 
+        # collect input shapes and types
+        input_types = {}  # type: Dict[str, tf.DType]
+        input_shapes = {}  # type: Dict[str, tf.TensorShape]
+
         for feedable in feedables:
-            feedable.register_input()
+            input_types.update(feedable.input_types)
+            input_shapes.update(feedable.input_shapes)
 
-        self.model.dataset_runner.register_input()
+        if self.train_mode:
+            train_data = self.model.train_dataset.get_dataset(
+                input_types, input_shapes)
 
-    def build_model(self) -> None:
+            val_data = [d.get_dataset(input_types, input_shapes)
+                        for d in self.model.val_datasets]
+
+            # Add preprocessed series among types
+            input_types = train_data.output_types
+            input_shapes = train_data.output_shapes
+
+            test_data = [d.get_dataset(input_types, input_shapes,
+                                       ignore_errors=True)
+                         for d in self.model.test_datasets]
+
+        else:
+            test_data = [d.get_dataset(input_types, input_shapes,
+                                       ignore_errors=True)
+                         for d in test_datasets]
+
+            # Add preprocessed series among types
+            input_types = test_data.output_types
+            input_shapes = test_data.output_shapes
+
+        # string handles
+        self.handle = tf.placeholder(tf.string, shape=[])
+        iterator = tf.data.Iterator.from_string_handle(
+            self.handle, input_types, input_shapes)
+        self.next_element = iterator.get_next()
+
+        sess = self.model.tf_manager.sessions[0]
+
+        if self.train_mode:
+            self.train_it = train_data.make_initializable_iterator()
+            self.val_its = [d.make_initializable_iterator() for d in val_data]
+            self.train_handle = sess.run(self.train_it.string_handle())
+            self.val_handles = sess.run([it.string_handle()
+                                         for it in self.val_its])
+
+        self.tst_its = [d.make_initializable_iterator() for d in test_data]
+        self.test_handles = sess.run([it.string_handle()
+                                      for it in self.tst_its])
+
+        for feedable in feedables:
+            feedable.register_input(self.next_element)
+
+        self.model.dataset_runner.register_input(self.next_element)
+
+    def build_model(self, test_datasets: List[Dataset] = None) -> None:
         if self._model_built:
             raise RuntimeError("build_model() called twice")
 
@@ -155,12 +210,13 @@ class Experiment:
             self.model.dataset_runner = DatasetRunner()
 
             # build dataset
-            self.register_inputs()
+            self.register_inputs(test_datasets)
 
             self._bless_graph_executors()
             self.model.tf_manager.initialize_sessions()
 
-            type(self)._current_experiment = None
+            # TODO(tf-data)
+            # type(self)._current_experiment = None
 
             if self.train_mode:
                 check_dataset_and_coders(self.model.train_dataset,
@@ -169,7 +225,7 @@ class Experiment:
                     check_dataset_and_coders(self.model.val_dataset,
                                              self.model.runners)
                 else:
-                    for val_dataset in self.model.val_dataset:
+                    for val_dataset in self.model.val_datasets:
                         check_dataset_and_coders(val_dataset,
                                                  self.model.runners)
 
@@ -177,7 +233,8 @@ class Experiment:
                 visualize_embeddings(self.model.visualize_embeddings,
                                      self.model.output)
 
-        self._check_unused_initializers()
+        # TODO(tf-data)
+        # self._check_unused_initializers()
 
     def train(self) -> None:
         if not self.train_mode:
@@ -237,9 +294,8 @@ class Experiment:
         self._vars_loaded = True
 
     def run_model(self,
-                  dataset: Dataset,
+                  dataset: FeedDict,
                   write_out: bool = False,
-                  batch_size: int = None,
                   log_progress: int = 0) -> Tuple[
                       List[ExecutionResult], Dict[str, List], Dict[str, List]]:
         """Run the model on a given dataset.
@@ -248,7 +304,6 @@ class Experiment:
             dataset: The dataset on which the model will be executed.
             write_out: Flag whether the outputs should be printed to a file
                 defined in the dataset object.
-            batch_size: size of the minibatch
             log_progress: log progress every X seconds
 
         Returns:
@@ -259,15 +314,6 @@ class Experiment:
         if not self._vars_loaded:
             self.load_variables()
 
-        toklevel = self.model.runners_batching_scheme.token_level_batching
-        assert self.model.runners_batching_scheme.batch_bucket_span is None
-
-        batching_scheme = BatchingScheme(
-            batch_size=batch_size or self.model.runners_batch_size,
-            batch_bucket_span=None,
-            token_level_batching=toklevel,
-            bucketing_ignore_series=[])
-
         with self.graph.as_default():
             # TODO: check_dataset_and_coders(dataset, self.model.runners)
             return run_on_dataset(
@@ -277,13 +323,11 @@ class Experiment:
                 dataset,
                 self.model.postprocess,
                 write_out=write_out,
-                log_progress=log_progress,
-                batching_scheme=batching_scheme)
+                log_progress=log_progress)
 
     def evaluate(self,
-                 dataset: Dataset,
+                 dataset: FeedDict,
                  write_out: bool = False,
-                 batch_size: int = None,
                  log_progress: int = 0,
                  name: str = None) -> Dict[str, Any]:
         """Run the model on a given dataset and evaluate the outputs.
@@ -292,7 +336,6 @@ class Experiment:
             dataset: The dataset on which the model will be executed.
             write_out: Flag whether the outputs should be printed to a file
                 defined in the dataset object.
-            batch_size: size of the minibatch
             log_progress: log progress every X seconds
             name: The name of the evaluated dataset
 
@@ -302,7 +345,7 @@ class Experiment:
             run.
         """
         execution_results, output_data, f_dataset = self.run_model(
-            dataset, write_out, batch_size, log_progress)
+            dataset, write_out, log_progress)
 
         evaluators = [(e[0], e[0], e[1]) if len(e) == 2 else e
                       for e in self.model.evaluation]
@@ -364,11 +407,9 @@ def create_config(train_mode: bool = True) -> Configuration:
     config.add_argument("tf_manager", required=False, default=None)
     config.add_argument("batch_size", required=False, default=None,
                         cond=lambda x: x is None or x > 0)
-    config.add_argument("batching_scheme", required=False, default=None)
     config.add_argument("output")
     config.add_argument("postprocess", required=False, default=None)
     config.add_argument("runners")
-    config.add_argument("runners_batch_size", required=False, default=None)
 
     if train_mode:
         config.add_argument("epochs", cond=lambda x: x >= 0)
@@ -397,6 +438,8 @@ def create_config(train_mode: bool = True) -> Configuration:
     else:
         config.add_argument("evaluation", required=False, default=None)
         for argument in _TRAIN_ARGS:
+            # if argument == "train_dataset":
+            #     continue
             config.ignore_argument(argument)
 
     return config

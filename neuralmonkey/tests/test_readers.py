@@ -6,7 +6,7 @@ import tempfile
 import numpy as np
 
 from neuralmonkey.readers.string_vector_reader import get_string_vector_reader
-from neuralmonkey.readers.plain_text_reader import T2TReader
+from neuralmonkey.readers.plain_text_reader import t2t_tokenized_text_reader
 
 STRING_INTS = """
 1   2 3
@@ -100,7 +100,7 @@ class TestStringVectorReader(unittest.TestCase):
 class TestT2TReader(unittest.TestCase):
 
     def setUp(self):
-        self.reader = T2TReader
+        self.reader = t2t_tokenized_text_reader
 
     def test_reader(self):
         text = "Ich bin  der čermák -=- - !!! alfonso "

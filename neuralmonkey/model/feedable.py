@@ -1,10 +1,12 @@
 from abc import ABCMeta
+
+from typing import Any, Dict, List
 # pylint: disable=unused-import
-from typing import Any, Dict, List, Optional
+from typing import Optional
 # pylint: enable=unused-import
 
 import tensorflow as tf
-from neuralmonkey.dataset import Dataset
+from neuralmonkey.decorators import tensor
 
 # pylint: disable=invalid-name
 FeedDict = Dict[tf.Tensor, Any]
@@ -28,23 +30,23 @@ class Feedable(metaclass=ABCMeta):
 
     def __init__(self) -> None:
         self.train_mode = tf.placeholder(tf.bool, [], "train_mode")
-        self.batch_size = tf.placeholder(tf.int32, [], "batch_size")
-        self._dataset = None  # type: Optional[Dict[str, tf.Tensor]]
+        self._dataset = None  # type: Optional[tf.data.Dataset]
 
-    def feed_dict(self, dataset: Dataset, train: bool = True) -> FeedDict:
+    @tensor
+    def batch_size(self) -> tf.Tensor:
+        # TODO(tf-data) allow for arbitrarily nested dataset series
+        return tf.shape(self.dataset[next(iter(self.dataset))])[0]
+
+    def feed_dict(self, train: bool = True) -> FeedDict:
         """Return a feed dictionary for the given feedable object.
 
         Arguments:
-            dataset: A dataset instance from which to get the data.
             train: Boolean indicating whether the model runs in training mode.
 
         Returns:
             A `FeedDict` dictionary object.
         """
-        fd = {}  # type: FeedDict
-        fd[self.train_mode] = train
-        fd[self.batch_size] = len(dataset)
-        return fd
+        return {self.train_mode: train}
 
     @property
     def input_types(self) -> Dict[str, tf.DType]:
@@ -60,10 +62,5 @@ class Feedable(metaclass=ABCMeta):
             raise RuntimeError("Getting dataset before registering it.")
         return self._dataset
 
-    def register_input(self) -> None:
-        assert self.input_types.keys() == self.input_shapes.keys()
-        self._dataset = {}
-
-        for s_id, dtype in self.input_types.items():
-            shape = self.input_shapes[s_id]
-            self.dataset[s_id] = tf.placeholder(dtype, shape, s_id)
+    def register_input(self, dataset: Dict[str, tf.Tensor]) -> None:
+        self._dataset = dataset

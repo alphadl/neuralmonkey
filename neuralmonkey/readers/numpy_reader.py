@@ -1,11 +1,34 @@
 from typing import List, Callable, Iterable
 import os
 
-from typeguard import check_argument_types
 import numpy as np
+import tensorflow as tf
+from typeguard import check_argument_types
 
 
-def single_tensor(files: List[str]) -> np.ndarray:
+def from_file_list(prefix: str,
+                   shape: List[int],
+                   suffix: str = "",
+                   default_tensor_name: str = "arr_0") -> Callable[
+                       [List[str]], tf.data.Dataset]:
+
+    gen = py_from_file_list(prefix, shape, suffix, default_tensor_name)
+
+    def reader(files: List[str]) -> tf.data.Dataset:
+        return tf.data.Dataset.from_generator(
+            lambda: gen(files),
+            output_types=tf.float32,
+            output_shapes=tf.TensorShape(shape))
+
+    return reader
+
+
+def single_tensor(files: List[str]) -> tf.data.Dataset:
+    tensor = py_single_tensor(files)
+    return tf.data.Dataset.from_tensor_slices(tensor)
+
+
+def py_single_tensor(files: List[str]) -> np.ndarray:
     """Load a single tensor from a numpy file."""
     check_argument_types()
     if len(files) == 1:
@@ -14,9 +37,10 @@ def single_tensor(files: List[str]) -> np.ndarray:
     return np.concatenate([np.load(f) for f in files], axis=0)
 
 
-def from_file_list(prefix: str,
-                   suffix: str = "",
-                   default_tensor_name: str = "arr_0") -> Callable:
+def py_from_file_list(prefix: str,
+                      shape: List[int],
+                      suffix: str = "",
+                      default_tensor_name: str = "arr_0") -> Callable:
     """Load a list of numpy arrays from a list of .npz numpy files.
 
     Args:
@@ -35,10 +59,11 @@ def from_file_list(prefix: str,
                 for line in f_list:
                     path = os.path.join(prefix, line.rstrip()) + suffix
                     with np.load(path) as npz:
-                        yield npz[default_tensor_name]
-
+                        arr = npz[default_tensor_name]
+                        arr_shape = list(arr.shape)
+                        if arr_shape != shape:
+                            raise ValueError(
+                                "Shapes do not match: expected {}, found {}"
+                                .format(shape, arr_shape))
+                        yield arr
     return load
-
-
-# pylint: disable=invalid-name
-numpy_file_list_reader = from_file_list(prefix="")

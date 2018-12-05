@@ -15,7 +15,6 @@ def load_runtime_config(config_path: str) -> argparse.Namespace:
     """Load a runtime configuration file."""
     cfg = Configuration()
     cfg.add_argument("test_datasets")
-    cfg.add_argument("batch_size", cond=lambda x: x > 0)
     cfg.add_argument("variables", cond=lambda x: isinstance(x, list))
 
     cfg.load_file(config_path)
@@ -36,17 +35,24 @@ def main() -> None:
                         help="look at the SGE variables for slicing the data")
     args = parser.parse_args()
 
-    datasets_model = load_runtime_config(args.datasets)
-
     exp = Experiment(config_path=args.config)
-    exp.build_model()
+    with exp.graph.as_default():
+        datasets_model = load_runtime_config(args.datasets)
+
+    exp.build_model(datasets_model.test_datasets)
     exp.load_variables(datasets_model.variables)
 
     if args.grid and len(datasets_model.test_datasets) > 1:
         raise ValueError("Only one test dataset supported when using --grid")
 
+    sess = exp.model.tf_manager.sessions[0]
+
     results = []
-    for dataset in datasets_model.test_datasets:
+    for dataset, tst_it, dataset_handle in zip(
+            datasets_model.test_datasets, exp.tst_its, exp.test_handles):
+
+        sess.run(tst_it.initializer)
+
         if args.grid:
             if ("SGE_TASK_FIRST" not in os.environ
                     or "SGE_TASK_LAST" not in os.environ
@@ -68,13 +74,11 @@ def main() -> None:
             dataset = dataset.subset(start, length)
 
         if exp.config.args.evaluation is None:
-            exp.run_model(dataset,
-                          write_out=True,
-                          batch_size=datasets_model.batch_size)
+            exp.run_model({exp.handle: dataset_handle},
+                          write_out=True)
         else:
-            eval_result = exp.evaluate(dataset,
-                                       write_out=True,
-                                       batch_size=datasets_model.batch_size)
+            eval_result = exp.evaluate({exp.handle: dataset_handle},
+                                       write_out=True)
             results.append(eval_result)
 
     if args.json:

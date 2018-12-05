@@ -7,14 +7,12 @@ import tensorflow as tf
 from tensorflow.contrib.tensorboard.plugins import projector
 from typeguard import check_argument_types
 
-from neuralmonkey.dataset import Dataset
 from neuralmonkey.decorators import tensor
-from neuralmonkey.model.feedable import FeedDict
 from neuralmonkey.model.model_part import ModelPart
 from neuralmonkey.model.parameterized import InitializerSpecs
 from neuralmonkey.model.stateful import TemporalStateful
 from neuralmonkey.tf_utils import get_variable
-from neuralmonkey.vocabulary import Vocabulary, pad_batch, sentence_mask
+from neuralmonkey.vocabulary import Vocabulary, sentence_mask
 
 
 # pylint: disable=abstract-method
@@ -140,13 +138,13 @@ class EmbeddedFactorSequence(Sequence):
         return {d_id: tf.TensorShape([None, None]) for d_id in self.data_ids}
 
     @tensor
-    def input_factor_indices(self) -> List[tf.Tensor]:
-        return [vocab.strings_to_indices(factor) for
-                vocab, factor in zip(self.vocabularies, self.input_factors)]
-
-    @tensor
     def input_factors(self) -> List[tf.Tensor]:
-        return [self.dataset[s_id] for s_id in self.dataset]
+        return [vocab.strings_to_indices(self.dataset[s_id],
+                                         self.max_length,
+                                         self.add_start_symbol,
+                                         self.add_end_symbol)
+                for vocab, s_id in zip(self.vocabularies,
+                                       self.data_ids)]
 
     # TODO this should be placed into the abstract embedding class
     def tb_embedding_visualization(self, logdir: str,
@@ -200,7 +198,7 @@ class EmbeddedFactorSequence(Sequence):
         """
         embedded_factors = []
         for (factor, embedding_matrix) in zip(
-                self.input_factor_indices, self.embedding_matrices):
+                self.input_factors, self.embedding_matrices):
             emb_factor = tf.nn.embedding_lookup(embedding_matrix, factor)
 
             # github.com/tensorflow/tensor2tensor/blob/v1.5.6/tensor2tensor/
@@ -219,30 +217,8 @@ class EmbeddedFactorSequence(Sequence):
     # pylint: disable=unsubscriptable-object
     @tensor
     def temporal_mask(self) -> tf.Tensor:
-        return sentence_mask(self.input_factor_indices[0])
+        return sentence_mask(self.input_factors[0])
     # pylint: enable=unsubscriptable-object
-
-    def feed_dict(self, dataset: Dataset, train: bool = False) -> FeedDict:
-        """Feed the placholders with the data.
-
-        Arguments:
-            dataset: The dataset.
-            train: A flag whether the train mode is enabled.
-
-        Returns:
-            The constructed feed dictionary that contains the factor data and
-            the mask.
-        """
-        fd = ModelPart.feed_dict(self, dataset, train)
-
-        # for checking the lengths of individual factors
-        for factor_plc, name in zip(self.input_factors, self.data_ids):
-            sentences = dataset.get_series(name)
-            fd[factor_plc] = pad_batch(
-                list(sentences), self.max_length, self.add_start_symbol,
-                self.add_end_symbol)
-
-        return fd
 
 
 class EmbeddedSequence(EmbeddedFactorSequence):
@@ -302,7 +278,7 @@ class EmbeddedSequence(EmbeddedFactorSequence):
     @property
     def inputs(self) -> tf.Tensor:
         """Return a 2D placeholder for the sequence inputs."""
-        return self.input_factor_indices[0]
+        return self.input_factors[0]
 
     @property
     def embedding_matrix(self) -> tf.Tensor:
