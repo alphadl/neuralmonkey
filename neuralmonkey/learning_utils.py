@@ -43,11 +43,9 @@ def training_loop(cfg: Namespace) -> None:
         cfg: Experiment configuration namespace.
     """
     _check_series_collisions(cfg.runners, cfg.postprocess)
-
-    log_model_variables(cfg.trainers)
-
-    initialize_model(cfg.tf_manager, cfg.initial_variables,
-                     cfg.runners + cfg.trainers)
+    _log_model_variables(cfg.trainers)
+    _initialize_model(cfg.tf_manager, cfg.initial_variables,
+                      cfg.runners + cfg.trainers)
 
     log("Initializing TensorBoard summary writer.")
     tb_writer = tf.summary.FileWriter(cfg.output,
@@ -238,7 +236,7 @@ def training_loop(cfg: Namespace) -> None:
         raise interrupt  # pylint: disable=raising-bad-type
 
 
-def log_model_variables(trainers: List[Trainer]) -> None:
+def _log_model_variables(trainers: List[Trainer]) -> None:
 
     var_list = list(set().union(*[t.var_list for t in trainers])) \
                # type: List[tf.Variable]
@@ -281,14 +279,14 @@ def log_model_variables(trainers: List[Trainer]) -> None:
     log("Total number of all parameters: {}".format(total_params))
 
 
-def initialize_model(tf_manager: TensorFlowManager,
+def _initialize_model(tf_manager: TensorFlowManager,
                      initial_variables: Optional[List[str]],
                      executables: List[GraphExecutor]):
 
     if initial_variables is None:
         # Assume we don't look at coder checkpoints when global
         # initial variables are supplied
-        tf_manager.initialize_model_parts(executables, save=True)
+        tf_manager.initialize_model_parts(executables)
     else:
         try:
             tf_manager.restore(initial_variables)

@@ -277,10 +277,8 @@ class TensorFlowManager:
                                     var_list=[g for g in tf.global_variables()
                                               if "reward_" not in g.name])
 
-    def initialize_model_parts(self, runners: Sequence[GraphExecutor],
-                               save: bool = False) -> None:
+    def initialize_model_parts(self, runners: Sequence[GraphExecutor]) -> None:
         """Initialize model parts variables from their checkpoints."""
-
         if any(not hasattr(r, "parameterizeds") for r in runners):
             raise TypeError(
                 "Args to initialize_model_parts must be trainers or runners")
@@ -289,10 +287,6 @@ class TensorFlowManager:
         for coder in parameterizeds:
             for session in self.sessions:
                 coder.load(session)
-
-        if save:
-            self.save(self.variables_files[0])
-
 
 def _feed_dicts(coders: Set[Feedable], train: bool = False):
     """Feed the coders with data from dataset.

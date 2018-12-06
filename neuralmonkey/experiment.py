@@ -13,8 +13,7 @@ import tensorflow as tf
 from tensorflow.contrib.tensorboard.plugins import projector
 from typeguard import check_argument_types
 
-from neuralmonkey.checking import (check_dataset_and_coders,
-                                   CheckingException)
+from neuralmonkey.checking import CheckingException
 from neuralmonkey.dataset import Dataset
 from neuralmonkey.logging import Logging, log, debug, warn
 from neuralmonkey.config.configuration import Configuration
@@ -218,23 +217,10 @@ class Experiment:
             # TODO(tf-data)
             # type(self)._current_experiment = None
 
-            if self.train_mode:
-                check_dataset_and_coders(self.model.train_dataset,
-                                         self.model.runners)
-                if isinstance(self.model.val_dataset, Dataset):
-                    check_dataset_and_coders(self.model.val_dataset,
-                                             self.model.runners)
-                else:
-                    for val_dataset in self.model.val_datasets:
-                        check_dataset_and_coders(val_dataset,
-                                                 self.model.runners)
+            if self.train_mode and self.model.visualize_embeddings is not None:
+                self.visualize_embeddings()
 
-            if self.train_mode and self.model.visualize_embeddings:
-                visualize_embeddings(self.model.visualize_embeddings,
-                                     self.model.output)
-
-        # TODO(tf-data)
-        # self._check_unused_initializers()
+        self._check_unused_initializers()
 
     def train(self) -> None:
         if not self.train_mode:
@@ -315,7 +301,6 @@ class Experiment:
             self.load_variables()
 
         with self.graph.as_default():
-            # TODO: check_dataset_and_coders(dataset, self.model.runners)
             return run_on_dataset(
                 self.model.tf_manager,
                 self.model.runners,
@@ -344,7 +329,7 @@ class Experiment:
             metrics applied on respective series loss and loss values from the
             run.
         """
-        execution_results, output_data, f_dataset = self.run_model(
+        execution_results, output_data, f_dataset = self.orun_model(
             dataset, write_out, log_progress)
 
         evaluators = [(e[0], e[0], e[1]) if len(e) == 2 else e
@@ -395,6 +380,27 @@ class Experiment:
             raise CheckingException(
                 "Initializers were specified for the following non-existent "
                 "variables: " + ", ".join(unused_initializers))
+
+    def visualize_embeddings(self) -> None:
+        """Visualize embeddings of sequences in `main.visualize_embeddings`."""
+        tb_projector = projector.ProjectorConfig()
+
+        for sequence, (i, (vocabulary, emb_matrix)) in [
+                (seq, enumerate(zip(seq.vocabularies, seq.embedding_matrices)))
+                for seq in self.model.visualize_embeddings]:
+
+            # TODO when vocabularies will have name parameter, change it
+            path = self.get_path("seq.{}-{}.tsv".format(sequence.name, i))
+            vocabulary.save_wordlist(path)
+
+            embedding = tb_projector.embeddings.add()
+            # pylint: disable=unsubscriptable-object
+            embedding.tensor_name = emb_matrix.name
+            embedding.metadata_path = path
+            # pylint: enable=unsubscriptable-object
+
+        summary_writer = tf.summary.FileWriter(self.model.output)
+        projector.visualize_embeddings(summary_writer, tb_projector)
 
     @classmethod
     def get_current(cls) -> "Experiment":
@@ -499,16 +505,3 @@ def save_git_info(git_commit_file: str, git_diff_file: str,
             )
     else:
         warn("No git executable found. Not storing git commit and diffs")
-
-
-def visualize_embeddings(sequences: List[EmbeddedFactorSequence],
-                         output_dir: str) -> None:
-    check_argument_types()
-
-    tb_projector = projector.ProjectorConfig()
-
-    for sequence in sequences:
-        sequence.tb_embedding_visualization(output_dir, tb_projector)
-
-    summary_writer = tf.summary.FileWriter(output_dir)
-    projector.visualize_embeddings(summary_writer, tb_projector)

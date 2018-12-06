@@ -146,30 +146,6 @@ class EmbeddedFactorSequence(Sequence):
                 for vocab, s_id in zip(self.vocabularies,
                                        self.data_ids)]
 
-    # TODO this should be placed into the abstract embedding class
-    def tb_embedding_visualization(self, logdir: str,
-                                   prj: projector):
-        """Link embeddings with vocabulary wordlist.
-
-        Used for tensorboard visualization.
-
-        Arguments:
-            logdir: directory where model is stored
-            projector: TensorBoard projector for storing linking info.
-        """
-        for i in range(len(self.vocabularies)):
-            # the overriding is turned to true, because if the model would not
-            # be allowed to override the output folder it would failed earlier.
-            # TODO when vocabularies will have name parameter, change it
-            metadata_path = self.name + "_" + str(i) + ".tsv"
-            self.vocabularies[i].save_wordlist(
-                os.path.join(logdir, metadata_path), True)
-
-            embedding = prj.embeddings.add()
-            # pylint: disable=unsubscriptable-object
-            embedding.tensor_name = self.embedding_matrices[i].name
-            embedding.metadata_path = metadata_path
-
     @tensor
     def embedding_matrices(self) -> List[tf.Tensor]:
         """Return a list of embedding matrices for each factor."""
