@@ -24,6 +24,7 @@ from neuralmonkey.learning_utils import (training_loop, evaluation,
 from neuralmonkey.model.sequence import EmbeddedFactorSequence
 from neuralmonkey.runners.base_runner import ExecutionResult, FeedDict
 from neuralmonkey.runners.dataset_runner import DatasetRunner
+from neuralmonkey.tf_manager import DatasetInitializers
 
 
 _TRAIN_ARGS = [
@@ -122,69 +123,98 @@ class Experiment:
             debug("Runner fetches: {}".format(runner.fetches))
         log("TF Graph built")
 
-    def register_inputs(self, test_datasets: List[Dataset] = None) -> None:
-        log("Initializing TF dataset")
+    def gather_train_datasets(self, types, shapes):
+        train_data = self.model.train_dataset.get_dataset(types, shapes)
 
+        val_data = [d.get_dataset(types, shapes)
+                    for d in self.model.val_datasets]
+
+        # Add preprocessed series among types
+        out_types = train_data.output_types
+        out_shapes = train_data.output_shapes
+
+        test_data = [d.get_dataset(out_types, out_shapes, ignore_errors=True)
+                     for d in self.model.test_datasets]
+
+        return train_data, val_data, test_data, out_types, out_shapes
+
+    def gather_runtime_datasets(self, types, shapes, test_datasets):
+        test_data = [d.get_dataset(types, shapes, ignore_errors=True)
+                     for d in test_datasets]
+
+        # Add preprocessed series among types
+        out_types = test_data[0].output_types
+        out_shapes = test_data[0].output_shapes
+
+        return test_data, out_types, out_shapes
+
+    def collect_feedables(self):
         feedables = set.union(*[ex.feedables for ex in self.model.runners])
         if self.train_mode:
             feedables |= set.union(
                 *[ex.feedables for ex in self.model.trainers])
 
+        return feedables
+
+    def get_feedable_types_and_shapes(self, feedables):
         # collect input shapes and types
-        input_types = {}  # type: Dict[str, tf.DType]
-        input_shapes = {}  # type: Dict[str, tf.TensorShape]
+        feed_types = {}  # type: Dict[str, tf.DType]
+        feed_shapes = {}  # type: Dict[str, tf.TensorShape]
 
         for feedable in feedables:
-            input_types.update(feedable.input_types)
-            input_shapes.update(feedable.input_shapes)
+            feed_types.update(feedable.input_types)
+            feed_shapes.update(feedable.input_shapes)
+
+        return feed_types, feed_shapes
+
+    def gather_tf_datasets(
+            self,
+            test_datasets: List[Dataset] = None) -> Tuple[DatasetInitializers]:
+        log("Initializing TF dataset")
+
+        feedables = self.collect_feedables()
+        feed_types, feed_shapes = self.get_feedable_types_and_shapes(feedables)
 
         if self.train_mode:
-            train_data = self.model.train_dataset.get_dataset(
-                input_types, input_shapes)
-
-            val_data = [d.get_dataset(input_types, input_shapes)
-                        for d in self.model.val_datasets]
-
-            # Add preprocessed series among types
-            input_types = train_data.output_types
-            input_shapes = train_data.output_shapes
-
-            test_data = [d.get_dataset(input_types, input_shapes,
-                                       ignore_errors=True)
-                         for d in self.model.test_datasets]
-
+            train_data, val_data, test_data, out_types, out_shapes = \
+                self.gather_train_datasets(feed_types, feed_shapes)
         else:
-            test_data = [d.get_dataset(input_types, input_shapes,
-                                       ignore_errors=True)
-                         for d in test_datasets]
-
-            # Add preprocessed series among types
-            input_types = test_data[0].output_types
-            input_shapes = test_data[0].output_shapes
+            test_data, out_types, out_shapes = self.gather_runtime_datasets(
+                feed_types, feed_shapes, test_datasets)
 
         # string handles
-        self.handle = tf.placeholder(tf.string, shape=[])
-        iterator = tf.data.Iterator.from_string_handle(
-            self.handle, input_types, input_shapes)
-        self.next_element = iterator.get_next()
+        self.dataset_handle = tf.placeholder(tf.string, shape=[])
+        iterator = tf.data.Iterator.from_string_handle(self.dataset_handle,
+                                                       out_types, out_shapes)
 
         sess = self.model.tf_manager.sessions[0]
 
+        train_it = None
+        val_its = None
+
         if self.train_mode:
-            self.train_it = train_data.make_initializable_iterator()
-            self.val_its = [d.make_initializable_iterator() for d in val_data]
-            self.train_handle = sess.run(self.train_it.string_handle())
-            self.val_handles = sess.run([it.string_handle()
-                                         for it in self.val_its])
+            train_it = train_data.make_initializable_iterator()
+            val_its = [d.make_initializable_iterator() for d in val_data]
+            self.train_handle = sess.run(train_it.string_handle())
+            self.val_handles = sess.run([it.string_handle() for it in val_its])
 
-        self.tst_its = [d.make_initializable_iterator() for d in test_data]
-        self.test_handles = sess.run([it.string_handle()
-                                      for it in self.tst_its])
+        tst_its = [d.make_initializable_iterator() for d in test_data]
+        self.test_handles = sess.run([it.string_handle() for it in tst_its])
 
+        self.model.tf_manager.register_iterator_initializers(
+            DatasetInitializers(
+                train=train_it.initializer,
+                val=[it.initializer for it in val_its],
+                test=[it.initializer for it in tst_its]))
+
+        self.register_feedable_input(feedables, iterator)
+
+    def register_feedable_input(self, feedables, iterator):
+        next_element = iterator.get_next()
         for feedable in feedables:
-            feedable.register_input(self.next_element)
+            feedable.register_input(next_element)
 
-        self.model.dataset_runner.register_input(self.next_element)
+        self.model.dataset_runner.register_input(next_element)
 
     def build_model(self, test_datasets: List[Dataset] = None) -> None:
         if self._model_built:
@@ -209,12 +239,11 @@ class Experiment:
             self.model.dataset_runner = DatasetRunner()
 
             # build dataset
-            self.register_inputs(test_datasets)
+            self.gather_tf_datasets(test_datasets)
 
             self._bless_graph_executors()
             self.model.tf_manager.initialize_sessions()
 
-            # TODO(tf-data)
             # type(self)._current_experiment = None
 
             if self.train_mode and self.model.visualize_embeddings is not None:

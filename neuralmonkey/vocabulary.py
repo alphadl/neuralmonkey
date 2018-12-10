@@ -326,10 +326,10 @@ class Vocabulary(collections.Sized):
 
         for vec in vectors:
             for sentence, word_i in zip(sentences, vec):
-                if not sentence or sentence[-1] != END_TOKEN:
-                    sentence.append(self.index_to_word[word_i])
+                #if not sentence or sentence[-1] != END_TOKEN:
+                sentence.append(self.index_to_word[word_i])
 
-        return [s[:-1] if s and s[-1] == END_TOKEN else s for s in sentences]
+        return sentences # [s[:-1] if s and s[-1] == END_TOKEN else s for s in sentences]
 
     def save_wordlist(self, path: str, overwrite: bool = False,
                       encoding: str = "utf-8") -> None:

@@ -6,6 +6,7 @@ from typeguard import check_argument_types
 
 from neuralmonkey.decorators import tensor
 from neuralmonkey.logging import warn
+from neuralmonkey.model.feedable import Feedable
 from neuralmonkey.runners.base_runner import GraphExecutor, NextExecute
 from neuralmonkey.trainers.objective import (
     Objective, Gradients, ObjectiveWeight)
@@ -14,7 +15,7 @@ BIAS_REGEX = re.compile(r"[Bb]ias")
 
 
 # pylint: disable=too-few-public-methods,too-many-locals,too-many-arguments
-class GenericTrainer(GraphExecutor):
+class GenericTrainer(GraphExecutor, Feedable):
 
     class Executable(GraphExecutor.Executable["GenericTrainer"]):
 
@@ -44,7 +45,8 @@ class GenericTrainer(GraphExecutor):
             histogram_summaries = (
                 result["histogram_summaries"] if self.summaries else None)
 
-            self.set_result([], losses=result["losses"],
+            self.set_result({}, losses=result["losses"],
+                            size=result["batch_size"],
                             scalar_summaries=scalar_summaries,
                             histogram_summaries=histogram_summaries,
                             image_summaries=None)
@@ -63,6 +65,7 @@ class GenericTrainer(GraphExecutor):
                  var_collection: str = None) -> None:
         check_argument_types()
         GraphExecutor.__init__(self, {obj.decoder for obj in objectives})
+        Feedable.__init__(self)
 
         self.objectives = objectives
         self.l1_weight = l1_weight
@@ -242,4 +245,5 @@ class GenericTrainer(GraphExecutor):
     def fetches(self) -> Dict[str, tf.Tensor]:
         return {"train_op": self.train_op,
                 "losses": self.objective_values,
+                "batch_size": self.batch_size,
                 "_update_ops": tf.get_collection(tf.GraphKeys.UPDATE_OPS)}

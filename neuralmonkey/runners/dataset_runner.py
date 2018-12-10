@@ -16,26 +16,61 @@ class DatasetRunner(GraphExecutor, Feedable):
         def collect_results(self, results: List[Dict]) -> None:
             res = results[0]
 
-            # Take care of nested data series (such as Audio in tests/ctc.ini)
-            for s_id in res:
-                if not tf.contrib.framework.nest.is_sequence(
-                        self.executor.dataset[s_id]):
-                    continue
+            # flat_path = next(tf.contrib.framework.nest.yield_flat_paths(res))
 
-                res[s_id] = list(zip(*tf.contrib.framework.nest.flatten_up_to(
-                    self.executor.dataset[s_id], res[s_id])))
+            # leaf = res
+            # for item in flat_path:
+            #     leaf = leaf[item]
 
-            for s_id in res:
-                if s_id in self.executor.string_series:
-                    res[s_id] = tf.contrib.framework.nest.map_structure(
-                        tf.compat.as_text,
-                        tf.contrib.framework.nest.map_structure(
-                            np.ndarray.tolist,
-                            res[s_id]))
+            size = len(next(iter(leaf)))
 
-            data = [dict(zip(res, series)) for series in zip(*res.values())]
 
-            self.set_result(data, [], None, None, None)
+            # size = None
+            # # Take care of nested data series (such as Audio in tests/ctc.ini)
+            # for s_id in res:
+            #     if not tf.contrib.framework.nest.is_sequence(
+            #             self.executor.dataset[s_id]):
+            #         continue
+
+            #     res[s_id] = tf.contrib.framework.nest.flatten_up_to(
+            #         self.executor.dataset[s_id], res[s_id])
+
+            #     if size is None:
+            #         size = len(res[s_id][0])
+
+            #     assert len(res[s_id][0]) == size
+
+
+                # res[s_id] = list(zip(*tf.contrib.framework.nest.flatten_up_to(
+                #     self.executor.dataset[s_id], res[s_id])))
+
+            # # results are List[Dict]
+            # # We want
+            # # Dict[str, List]
+
+
+
+            # for s_id in res:
+
+
+            # for s_id in res:
+            #     if s_id in self.executor.string_series:
+            #         res[s_id] = tf.contrib.framework.nest.map_structure(
+            #             tf.compat.as_text,
+            #             tf.contrib.framework.nest.map_structure(
+            #                 np.ndarray.tolist,
+            #                 res[s_id]))
+            #     else:
+            #         res[s_id] = tf.contrib.framework.nest.map_structure(
+            #             np.ndarray.tolist, res[s_id])
+
+            # # now, the structure is Dict[str, Batch[things]]
+            # import ipdb;ipdb.set_trace()
+
+            # # data = [dict(zip(res, series)) for series in zip(*res.values())]
+
+            # assert size is not None
+            self.set_result(res, {}, size, None, None, None)
     # pylint: enable=too-few-public-methods
 
     def __init__(self) -> None:
@@ -53,4 +88,12 @@ class DatasetRunner(GraphExecutor, Feedable):
     @tensor
     def fetches(self) -> Dict[str, tf.Tensor]:
         assert self.dataset is not None
+
+        # dataset is not strictly Dict[str, tf.Tensor]!!!
+        # dataset is a Dict[str, nest] where nest is a nested structure of tensors
+
+        # flatten nest with paths to tuples str, tf.Tensor
+
+        # aby se to zas dalo feedovat, musí se to podle těch cest zase složit
+
         return self.dataset

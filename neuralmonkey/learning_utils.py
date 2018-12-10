@@ -15,9 +15,9 @@ from termcolor import colored
 from neuralmonkey.logging import log, log_print, warn
 from neuralmonkey.dataset import Dataset
 from neuralmonkey.tf_manager import TensorFlowManager
+from neuralmonkey.model.feedable import Feedable
 from neuralmonkey.runners.base_runner import (
-    BaseRunner, ExecutionResult, reduce_execution_results, FeedDict,
-    GraphExecutor)
+    BaseRunner, ExecutionResult, FeedDict, GraphExecutor)
 from neuralmonkey.runners.dataset_runner import DatasetRunner
 from neuralmonkey.trainers.generic_trainer import GenericTrainer
 from neuralmonkey.trainers.multitask_trainer import MultitaskTrainer
@@ -52,7 +52,9 @@ def training_loop(cfg: Namespace) -> None:
                                       cfg.tf_manager.sessions[0].graph)
     log("TensorBoard writer initialized.")
 
-    feedables = set.union(*[ex.feedables for ex in cfg.runners + cfg.trainers])
+    runtime_feedables = set.union(*[ex.feedables for ex in cfg.runners])
+    runtime_feedables |= cfg.dataset_runner.feedables
+    train_feedables = set.union(*[ex.feedables for ex in cfg.trainers])
 
     log("Starting training")
     profiler = TrainingProfiler()
@@ -68,18 +70,15 @@ def training_loop(cfg: Namespace) -> None:
     from neuralmonkey.experiment import Experiment
     exp = Experiment.get_current()
 
-    train_it = exp.train_it
-    val_its = exp.val_its
-    tst_its = exp.tst_its
     train_handle = exp.train_handle
     val_handles = exp.val_handles
     test_handles = exp.test_handles
-    handle = exp.handle
+    handle = exp.dataset_handle
 
     try:
         for epoch_n in range(1, cfg.epochs + 1):
 
-            sess.run(train_it.initializer)
+            cfg.tf_manager.init_training()
 
             # TODO(tf-data) skip train_start_offset
             batch_n = 0
@@ -93,26 +92,59 @@ def training_loop(cfg: Namespace) -> None:
                     batch_n += 1
                     step += 1
 
-                    # TODO(tf-data) tohle je nepresny!
-                    seen_instances += 1
-
                     if cfg.log_timer(step, profiler.last_log_time):
-                        trainer_result = cfg.tf_manager.execute(
-                            {handle: train_handle},
-                            feedables, cfg.trainers, train=True, summaries=True)
-                        train_results, train_outputs, f_batch = run_on_dataset(
-                            cfg.tf_manager, cfg.runners, cfg.dataset_runner,
-                            {handle: train_handle}, cfg.postprocess,
-                            write_out=False, compute_losses=True,
-                            single_batch=True)
 
-                        # ensure train outputs are iterable more than once
-                        train_outputs = {
-                            k: list(v) for k, v in train_outputs.items()}
+                        f_batch = prefetch_dataset(
+                            cfg.tf_manager, {handle: train_handle},
+                            cfg.dataset_runner)
+
+                        # se zapnutym list zipem v dataset runneru mi to sem
+                        # hodí Dict[str:series, List:batch[Tuple:factor[data]]]
+                        # ale dataset chce
+                        # Dict[str:series, Tuple:factor[List:batch]]
+
+                        bfd = {}
+                        for s_id in f_batch.outputs:
+                            bfd[s_id] = list(map(list, zip(*f_batch.outputs[s_id])))[0]
+
+                        batch_feed_dict = dict(zip(
+                            tf.contrib.framework.nest.flatten(cfg.dataset_runner.dataset),
+                            tf.contrib.framework.nest.flatten_up_to(cfg.dataset_runner.dataset, bfd)))
+
+                        exec_result, _ = run_batch(
+                            cfg.tf_manager,
+                            batch_feed_dict,
+                            cfg.runners, cfg.dataset_runner,
+                            runtime_feedables,
+                            cfg.postprocess,
+                            compute_losses=True)
+
+                        trainer_result = cfg.tf_manager.execute(
+                            batch_feed_dict, train_feedables, cfg.trainers,
+                            train=True, summaries=True)
+                        seen_instances += trainer_result[0].size
+
+                        exec_result, _ = run_batch(
+                            cfg.tf_manager,
+                            batch_feed_dict,
+                            cfg.runners, cfg.dataset_runner,
+                            runtime_feedables,
+                            cfg.postprocess,
+                            compute_losses=True)
+
+                        nest = tf.contrib.framework.nest
+                        def normalize(arr):
+                            if np.issubdtype(arr.dtype, np.number):
+                                return arr
+                            else:
+                                return nest.map_structure(
+                                    tf.compat.as_text, arr.tolist())
+
+                        exec_result = exec_result._replace(outputs=nest.map_structure(normalize, exec_result.outputs))
+                        input_data = nest.map_structure(normalize, f_batch.outputs)
 
                         train_evaluation = evaluation(
-                            cfg.evaluation, f_batch, cfg.runners,
-                            train_results, train_outputs)
+                            cfg.evaluation, input_data, cfg.runners, exec_result)
 
                         _log_continuous_evaluation(
                             tb_writer, cfg.main_metric, train_evaluation,
@@ -121,44 +153,46 @@ def training_loop(cfg: Namespace) -> None:
 
                         profiler.log_done()
                     else:
-                        cfg.tf_manager.execute(
+                        res = cfg.tf_manager.execute(
                             {handle: train_handle},
-                            feedables, cfg.trainers, train=True,
+                            train_feedables, cfg.trainers, train=True,
                             summaries=False)
+                        seen_instances += res[0].size
 
                     if cfg.val_timer(step, profiler.last_val_time):
                         log_print("")
                         profiler.validation_start()
                         val_examples = 0
 
-                        sess.run([v.initializer for v in val_its])
+                        cfg.tf_manager.init_validation()
 
                         for val_id, valhand in enumerate(val_handles):
 
-                            val_results, val_outputs, f_valset = run_on_dataset(
-                                cfg.tf_manager, cfg.runners,
-                                cfg.dataset_runner, {handle: valhand},
+                            val_result, f_valset = run_on_dataset(
+                                cfg.tf_manager,
+                                {handle: valhand},
+                                cfg.runners, cfg.dataset_runner,
+                                runtime_feedables,
                                 cfg.postprocess, write_out=False,
                                 compute_losses=True)
 
-                            val_examples += len(next(iter(f_valset.values())))
-                            # ensure val outputs are iterable more than once
-                            val_outputs = {k: list(v)
-                                           for k, v in val_outputs.items()}
-                            val_evaluation = evaluation(
-                                cfg.evaluation, f_valset, cfg.runners,
-                                val_results, val_outputs)
+                            val_examples += val_result.size
 
                             valheader = ("Validation (epoch {}, batch number {}):"
                                          .format(epoch_n, batch_n))
                             log(valheader, color="blue")
                             _print_examples(
-                                f_valset, val_outputs,
+                                f_valset.outputs, val_result.outputs,
+                                f_valset.size,
                                 cfg.val_preview_input_series,
                                 cfg.val_preview_output_series,
                                 cfg.val_preview_num_examples)
                             log_print("")
                             log(valheader, color="blue")
+
+                            val_evaluation = evaluation(
+                                cfg.evaluation, f_valset.outputs, cfg.runners,
+                                val_result)
 
                             # The last validation set is selected to be the main
                             if val_id == len(cfg.val_datasets) - 1:
@@ -196,7 +230,7 @@ def training_loop(cfg: Namespace) -> None:
                                 cfg.val_datasets) > 1 else None
                             _log_continuous_evaluation(
                                 tb_writer, cfg.main_metric, val_evaluation,
-                                seen_instances, epoch_n, cfg.epochs, val_results,
+                                seen_instances, epoch_n, cfg.epochs, [val_result],
                                 train=False, dataset_name=v_name)
 
                         profiler.validation_done()
@@ -218,13 +252,16 @@ def training_loop(cfg: Namespace) -> None:
 
     if cfg.test_datasets:
         cfg.tf_manager.restore_best_vars()
-
-        sess.run([t.initializer for t in tst_its])
+        cfg.tf_manager.init_testing()
 
         for test_id, testhand in enumerate(test_handles):
             test_results, test_outputs, f_testset = run_on_dataset(
-                cfg.tf_manager, cfg.runners, cfg.dataset_runner,
-                {handle: testhand}, cfg.postprocess, write_out=True,
+                cfg.tf_manager,
+                {handle: testhand},
+                cfg.runners, cfg.dataset_runner,
+                runtime_feedables,
+                cfg.postprocess,
+                write_out=True,
                 compute_losses=True)
             # ensure test outputs are iterable more than once
             test_outputs = {k: list(v) for k, v in test_outputs.items()}
@@ -314,15 +351,84 @@ def _check_series_collisions(runners: List[BaseRunner],
                 runners_outputs.add(series)
 
 
+def prefetch_dataset(tf_manager: TensorFlowManager,
+                     data_feed_dict: FeedDict,
+                     dataset_runner: DatasetRunner) -> Dict[str, Any]:
+    """Use this function for pre-fetching a batch as a feed dictionary to
+    be able to evaluate the model on a single batch multiple times. """
+
+    data_result = tf_manager.execute(data_feed_dict, {dataset_runner},
+                                     [dataset_runner])
+
+    return data_result[0]
+
+
+def run_batch(tf_manager: TensorFlowManager,
+              data_feed_dict: FeedDict,
+              runners: List[BaseRunner],
+              dataset_runner: DatasetRunner,
+              feedables: Set[Feedable],
+              postprocess: Postprocess,
+              compute_losses: bool = False) -> Tuple[ExecutionResult]:
+    """The goal of this function is to run a batch and merge execution results
+    from different graph executors."""
+
+    executors = []  # type: List[GraphExecutor]
+    executors.extend(runners)
+    executors.append(dataset_runner)
+
+    execution_results = tf_manager.execute(
+        data_feed_dict, feedables, executors, compute_losses=compute_losses)
+
+    sizes = set(ex.size for ex in execution_results)
+    assert len(sizes) == 1
+    processed_examples = next(iter(sizes))
+
+    results = execution_results[:-1]
+    dataset = execution_results[-1]
+
+    # Join execution results from different runners
+    result_data = {}
+    for s_id, data in (
+            pair for res in results for pair in res.outputs.items()):
+
+        # for s_id, data in output.items():
+        if s_id in result_data:
+            raise ValueError("Overwriting output series forbidden.")
+        result_data[s_id] = data
+
+    # Run dataset-level postprocessing.
+    if postprocess is not None:
+        for s_id, postprocessor in postprocess:
+            result_data[s_id] = postprocessor(dataset, result_data)
+
+    # Check output series lengths.
+    for s_id, data in result_data.items():
+        if len(data) != processed_examples:
+            warn("Output '{}' has length {}, but input dataset size is {}"
+                 .format(s_id, len(data), processed_examples))
+
+    losses = {}
+    for loss_dict in [res.losses for res in results]:
+        if any(l in losses for l in loss_dict):
+            raise ValueError("Overwriting losses forbidden.")
+        losses.update(loss_dict)
+
+    return ExecutionResult(result_data, losses, processed_examples,
+                           [res.scalar_summaries for res in execution_results],
+                           [res.image_summaries for res in execution_results],
+                           [res.histogram_summaries for res in execution_results]), dataset
+
+
 def run_on_dataset(tf_manager: TensorFlowManager,
+                   data_feed_dict: FeedDict,
                    runners: List[BaseRunner],
                    dataset_runner: DatasetRunner,
-                   dataset: FeedDict,
+                   feedables: Set[Feedable],
                    postprocess: Postprocess,
                    write_out: bool = False,
                    log_progress: int = 0,
-                   compute_losses: bool = False,
-                   single_batch: bool = False) -> Tuple[
+                   compute_losses: bool = False) -> Tuple[
                        List[ExecutionResult],
                        Dict[str, List],
                        Dict[str, List]]:
@@ -335,7 +441,7 @@ def run_on_dataset(tf_manager: TensorFlowManager,
         tf_manager: TensorFlow manager with initialized sessions.
         runners: A function that runs the code
         dataset_runner: A runner object that fetches the data inputs
-        dataset: The dataset on which the model will be executed.
+        data_feed_dict: Feed dict that provides the dataset.
         evaluators: List of evaluators that are used for the model
             evaluation if the target data are provided.
         postprocess: Dataset-level postprocessors
@@ -343,21 +449,24 @@ def run_on_dataset(tf_manager: TensorFlowManager,
             in the dataset object.
         log_progress: log progress every X seconds
 
-        extra_fetches: Extra tensors to evaluate for each batch.
-
     Returns:
         Tuple of resulting sentences/numpy arrays, and evaluation results if
         they are available which are dictionary function -> value.
 
     """
     last_log_time = time.process_time()
-    batch_results = [[] for _ in runners]  # type: List[List[ExecutionResult]]
-    batch_results.append([])  # for dataset runner
-
-    feedables = set.union(*[runner.feedables for runner in runners])
-    feedables |= dataset_runner.feedables
+    batch_results = []
+    batch_inputs = []
 
     processed_examples = 0
+
+    nest = tf.contrib.framework.nest
+    def normalize(arr):
+        if np.issubdtype(arr.dtype, np.number):
+            return arr
+        else:
+            return nest.map_structure(
+                tf.compat.as_text, arr.tolist())
 
     while True:
         try:
@@ -365,65 +474,64 @@ def run_on_dataset(tf_manager: TensorFlowManager,
                 log("Processed {} examples.".format(processed_examples))
                 last_log_time = time.process_time()
 
-            executors = []  # type: List[GraphExecutor]
-            executors.extend(runners)
-            executors.append(dataset_runner)
+            result, dataset = run_batch(tf_manager, data_feed_dict, runners,
+                                        dataset_runner, feedables, postprocess,
+                                        compute_losses)
 
-            execution_results = tf_manager.execute(
-                dataset, feedables, executors, compute_losses=compute_losses)
+            batch_results.append(result._replace(
+                outputs=nest.map_structure(normalize, result.outputs)))
+            batch_inputs.append(dataset._replace(
+                outputs=nest.map_structure(normalize, dataset.outputs)))
 
-            # TODO(tf-data)
-            #processed_examples += batching_scheme.batch_size  # TODO NEPRESNE
-
-            for script_list, ex_result in zip(batch_results, execution_results):
-                script_list.append(ex_result)
-
-            if single_batch:
-                break
-
+            processed_examples += result.size
         except tf.errors.OutOfRangeError:
-            if single_batch:
-                # During training, it may happen that logging is performed
-                # just at the end of epoch. We gracefully ignore this logging
-                # step by re-raising the exception.
-                raise
             break
 
-    # Transpose runner interim results.
-    all_results = [reduce_execution_results(res) for res in batch_results[:-1]]
+    # Join execution results from different batches. Note that the arrays can
+    # differ in both batch and time dimensions.
+    joined_result = join_execution_results(batch_results)
+    joined_inputs = join_execution_results(batch_inputs, dataset_runner.dataset)
 
-    input_transposed = reduce_execution_results(batch_results[-1]).outputs
+    #for res in batch_results]
+    # output_results = joined_result
+    # dataset = joined_results[-1].outputs
 
-    fetched_input = {
-        k: [dic[k] for dic in input_transposed] for k in input_transposed[0]}
-    fetched_input_lengths = {s: len(fetched_input[s]) for s in fetched_input}
+    # fetched_input = {
+    #     k: [dic[k] for dic in input_transposed] for k in input_transposed[0]}
 
-    if len(set(fetched_input_lengths.values())) != 1:
-        warn("Fetched input dataset series are not of the same length: {}"
-             .format(str(fetched_input_lengths)))
+    # TODO(tf-data) nested structures
+    # fetched_input_lengths = {s: len(fetched_input[s]) for s in fetched_input}
 
-    # TODO(tf-data) this does not work when series are nested
-    dataset_len = fetched_input_lengths[next(iter(fetched_input_lengths))]
+    # if len(set(fetched_input_lengths.values())) != 1:
+    #     warn("Fetched input dataset series are not of the same length: {}"
+    #          .format(str(fetched_input_lengths)))
 
-    # Convert execution results to dictionary.
-    result_data = {runner.output_series: result.outputs
-                   for runner, result in zip(runners, all_results)}
+    # # TODO(tf-data) this does not work when series are nested
+    # dataset_len = fetched_input_lengths[next(iter(fetched_input_lengths))]
 
-    # Run dataset-level postprocessing.
-    if postprocess is not None:
-        for series_name, postprocessor in postprocess:
-            postprocessed = postprocessor(fetched_input, result_data)
-            if not hasattr(postprocessed, "__len__"):
-                postprocessed = list(postprocessed)
+    # Join execution results from different runners
 
-            result_data[series_name] = postprocessed
+    # result_data = {}
+    # for s_id, data in (pair for res in output_results
+    #                    for pair in res.outputs.items()):
 
-    # Check output series lengths.
-    for series_id, data in result_data.items():
-        if len(data) != dataset_len:
-            warn("Output '{}' has length {}, but input dataset size is {}"
-                 .format(series_id, len(data), dataset_len))
+    #     # for s_id, data in output.items():
+    #     if s_id in result_data:
+    #         raise ValueError("Overwriting output series forbidden.")
+    #     result_data[s_id] = data
 
+    # # Run dataset-level postprocessing.
+    # if postprocess is not None:
+    #     for s_id, postprocessor in postprocess:
+    #         result_data[s_id] = postprocessor(dataset, result_data)
+
+    # # Check output series lengths.
+    # for s_id, data in result_data.items():
+    #     if len(data) != processed_examples:
+    #         warn("Output '{}' has length {}, but input dataset size is {}"
+    #              .format(s_id, len(data), processed_examples))
+
+    # POZOR TOHLE SE NESMI SMAZAT Z run_on_dataset !!! (anebo se to dá dál)
     # TODO(tf-data)
     # if write_out and dataset.outputs is not None:
     #     for series_id, data in result_data.items():
@@ -437,10 +545,55 @@ def run_on_dataset(tf_manager: TensorFlowManager,
     #     log("Dataset does not have any outputs, nothing to write out.",
     #         color="red")
 
-    return all_results, result_data, fetched_input
+    return joined_result, joined_inputs
 
 
-def evaluation(evaluators, batch, runners, execution_results, result_data):
+# TODO(tf-data) add unit tests!
+def join_execution_results(
+        execution_results: List[ExecutionResult],
+        output_structure: Any = None) -> ExecutionResult:
+    """Aggregate execution results into one."""
+    losses_sum = {loss: 0. for loss in execution_results[0].losses}
+
+    def join(*args):
+        joined = []
+
+        for arg in args:
+            if isinstance(arg, np.ndarray):
+                joined += np.split(arg, arg.shape[0])
+            elif isinstance(arg, list):
+                joined += arg
+            else:
+                raise NotImplementedError("Unsuported output sequence type")
+        return joined
+
+    if output_structure is None:
+        # Assume dictionary of elements that should be concatenated
+        output_structure = {key: 0 for key in execution_results[0].outputs}
+
+    joined_outputs = tf.contrib.framework.nest.map_structure_up_to(
+        output_structure, join, *(res.outputs for res in execution_results))
+
+    for result in execution_results:
+        for l_id, loss in result.losses.items():
+            losses_sum[l_id] += loss * result.size
+
+        # TODO aggregate TensorBoard summaries
+
+    # TODO(tf-data) figure out why there were the following lines:
+    # if outputs and isinstance(outputs[0], np.ndarray):
+    #    outputs = np.array(outputs)
+
+    total_size = sum(ex.size for ex in execution_results)
+    losses = {l_id: loss / total_size for l_id, loss in losses_sum.items()}
+
+    return ExecutionResult(joined_outputs, losses_sum, total_size,
+                           execution_results[0].scalar_summaries,
+                           execution_results[0].histogram_summaries,
+                           execution_results[0].image_summaries)
+
+
+def evaluation(evaluators, batch, runners, execution_result):
     """Evaluate the model outputs.
 
     Args:
@@ -454,23 +607,19 @@ def evaluation(evaluators, batch, runners, execution_results, result_data):
         Dictionary of evaluation names and their values which includes the
         metrics applied on respective series loss and loss values from the run.
     """
-    eval_result = {}
-
     # losses
-    for runner, result in zip(runners, execution_results):
-        for name, value in zip(runner.loss_names, result.losses):
-            eval_result["{}/{}".format(runner.output_series, name)] = value
+    eval_result = execution_result.losses
 
     # evaluation metrics
-    for hypothesis_id, reference_id, function in evaluators:
-        if reference_id not in batch or hypothesis_id not in result_data:
+    for hyp_id, ref_id, evaluator in evaluators:
+        if ref_id not in batch or hyp_id not in execution_result.outputs:
             continue
 
-        desired_output = batch[reference_id]
-        model_output = result_data[hypothesis_id]
+        references = [tup[0] for tup in batch[ref_id]]
+        hypotheses = [tup[0] for tup in execution_result.outputs[hyp_id]]
 
-        eval_result["{}/{}".format(hypothesis_id, function.name)] = function(
-            model_output, desired_output)
+        eval_key = "{}/{}".format(hyp_id, evaluator.name)
+        eval_result[eval_key] = evaluator(hypotheses, references)
 
     return eval_result
 
@@ -481,7 +630,7 @@ def _log_continuous_evaluation(tb_writer: tf.summary.FileWriter,
                                seen_instances: int,
                                epoch: int,
                                max_epochs: int,
-                               execution_results: List[ExecutionResult],
+                               execution_results: ExecutionResult,
                                train: bool = False,
                                dataset_name: str = None) -> None:
     """Log the evaluation results and the TensorBoard summaries."""
@@ -497,13 +646,22 @@ def _log_continuous_evaluation(tb_writer: tf.summary.FileWriter,
                                                          eval_string)
     log(eval_string, color=color)
 
-    if tb_writer:
-        for result in execution_results:
-            for summaries in [result.scalar_summaries,
-                              result.histogram_summaries,
-                              result.image_summaries]:
-                if summaries is not None:
-                    tb_writer.add_summary(summaries, seen_instances)
+    if not tb_writer:
+        return
+
+    for summaries in [summ for res in execution_results
+                      for summ in (res.scalar_summaries,
+                                   res.histogram_summaries,
+                                   res.image_summaries)]:
+        if summaries is None:
+            continue
+
+        if isinstance(summaries, list):
+            for summary in summaries:
+                if summary is not None:
+                    tb_writer.add_summary(summary, seen_instances)
+        else:
+            tb_writer.add_summary(summaries, seen_instances)
 
         external_str = \
             tf.Summary(value=[tf.Summary.Value(tag=prefix + "_" + name,
@@ -541,13 +699,21 @@ def print_final_evaluation(eval_result: Evaluation, name: str = None) -> None:
     log_print("")
 
 
-def _data_item_to_str(item: Any) -> str:
+def _data_item_to_str(item: Tuple) -> str:
+
+    if len(item) == 1:
+        return _data_item_to_str2(item[0])
+
+    items = [_data_item_to_str2(i) for i in item]
+    return "({})".format(items)
+
+def _data_item_to_str2(item: Any) -> str:
     if isinstance(item, list):
-        return " ".join([_data_item_to_str(i) for i in item])
+        return " ".join([_data_item_to_str2(i) for i in item])
 
     if isinstance(item, dict):
         return "{\n      " + "\n      ".join(
-            ["{}: {}".format(_data_item_to_str(key), _data_item_to_str(val))
+            ["{}: {}".format(_data_item_to_str2(key), _data_item_to_str2(val))
              for key, val in item.items()]) + "\n    }"
 
     if isinstance(item, np.ndarray) and len(item.shape) > 1:
@@ -558,6 +724,7 @@ def _data_item_to_str(item: Any) -> str:
 
 def _print_examples(dataset: Dict[str, List],
                     outputs: Dict[str, List],
+                    dataset_size: int,
                     val_preview_input_series: Optional[List[str]] = None,
                     val_preview_output_series: Optional[List[str]] = None,
                     num_examples=15) -> None:
@@ -588,10 +755,10 @@ def _print_examples(dataset: Dict[str, List],
     assert outputs
 
     if val_preview_input_series is not None:
-        target_series_names = [s for s in target_series_names
-                               if s in val_preview_input_series]
-        source_series_names = [s for s in source_series_names
-                               if s in val_preview_input_series]
+        target_series_names = [s_id for s_id in target_series_names
+                               if s_id in val_preview_input_series]
+        source_series_names = [s_id for s_id in source_series_names
+                               if s_id in val_preview_input_series]
 
     if val_preview_output_series is not None:
         output_series_names = [s for s in output_series_names
@@ -599,15 +766,10 @@ def _print_examples(dataset: Dict[str, List],
 
     # for further indexing we need to make sure, all relevant
     # dataset series are lists
-    target_series = {series_id: list(dataset[series_id])
-                     for series_id in target_series_names}
-    source_series = {series_id: list(dataset[series_id])
-                     for series_id in source_series_names}
+    target_series = {s_id: dataset[s_id] for s_id in target_series_names}
+    source_series = {s_id: dataset[s_id] for s_id in source_series_names}
 
-    dataset_length = len(next(iter(dataset.values())))
-    num_examples = min(dataset_length, num_examples)
-
-    for i in range(num_examples):
+    for i in range(min(num_examples, dataset_size)):
         log_print(colored("  [{}]".format(i + 1), color="magenta",
                           attrs=["bold"]))
 

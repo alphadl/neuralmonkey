@@ -6,7 +6,7 @@ variables.
 
 """
 # pylint: disable=unused-import
-from typing import Any, List, Union, Optional, Set, Sequence
+from typing import Any, List, Union, Optional, Set, Sequence, NamedTuple
 # pylint: enable=unused-import
 
 import os
@@ -22,6 +22,25 @@ from neuralmonkey.logging import log
 from neuralmonkey.model.feedable import Feedable
 from neuralmonkey.runners.base_runner import (
     FeedDict, ExecutionResult, GraphExecutor)
+
+
+class DatasetInitializers(NamedTuple(
+        "DatasetInitializers",
+        [("train", Any),
+         ("val", Any),
+         ("test", Any)])):
+# class DatasetInitializers(NamedTuple(
+#         "DatasetInitializers",
+#         [("train", Optional[tf.Operation]        ),
+#          ("val", Optional[List[tf.Operation]]    )
+#          ("test", Optional[List[tf.Operation]]   )])):
+    """Dataset initializers named tuple.
+
+    Attributes:
+        train: The training iterator initializer (unused when running models)
+        val: A list of validation initializers (unused when running models)
+        test: A list of test data initializers (optional when training)
+    """
 
 
 # pylint: disable=too-many-instance-attributes
@@ -81,6 +100,8 @@ class TensorFlowManager:
             self.sessions = [tf_debug.LocalCLIDebugWrapperSession(sess)
                              for sess in self.sessions]
 
+        self._iter_initializers = None  # type: Optional[DatasetInitializers]
+
         self.saver = None
 
         self.best_score_index = 0
@@ -94,6 +115,40 @@ class TensorFlowManager:
         self.variables_files = []  # type: List[str]
         self._best_vars_file = None  # type: Optional[str]
     # pylint: enable=too-many-arguments
+
+    def register_iterator_initializers(
+            self, initializers: DatasetInitializers) -> None:
+        if self._iter_initializers is not None:
+            raise RuntimeError("Iterator initializers already registered.")
+
+        self._iter_initializers = initializers
+
+    def init_training(self) -> None:
+        if self._iter_initializers is None:
+            raise RuntimeError("Iterator initializers not yet registered.")
+        if self._iter_initializers.train is None:
+            raise RuntimeError("No training initializer specified.")
+
+        for sess in self.sessions:
+            sess.run(self._iter_initializers.train)
+
+    def init_validation(self) -> None:
+        if self._iter_initializers is None:
+            raise RuntimeError("Iterator initializers not yet registered.")
+        if self._iter_initializers.val is None:
+            raise RuntimeError("No validation initializer specified.")
+
+        for sess in self.sessions:
+            sess.run([op for op in self._iter_initializers.val])
+
+    def init_testing(self) -> None:
+        if self._iter_initializers is None:
+            raise RuntimeError("Iterator initializers not yet registered.")
+        if self._iter_initializers.test is None:
+            raise RuntimeError("No testing initializer specified.")
+
+        for sess in self.sessions:
+            sess.run([op for op in self._iter_initializers.test])
 
     @property
     def best_vars_file(self) -> str:

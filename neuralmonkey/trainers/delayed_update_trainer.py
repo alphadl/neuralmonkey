@@ -27,12 +27,14 @@ class DelayedUpdateTrainer(GenericTrainer):
             self.res_hist_sums = None
             self.res_scal_sums = None
             self.res_losses = None
+            self.res_batch = None
 
         def next_to_execute(self) -> NextExecute:
 
             if self.state == 0:  # ACCUMULATING
                 fetches = {"accumulators": self.executor.accumulate_ops,
                            "counter": self.executor.cumulator_counter,
+                           "batch_size": self.executor.batch_size,
                            "losses": self.executor.objective_values}
 
             elif self.state == 1:  # UPDATING
@@ -54,6 +56,7 @@ class DelayedUpdateTrainer(GenericTrainer):
 
             if self.state == 0:  # ACCUMULATING
                 self.res_losses = result["losses"]
+                self.res_batch = result["batch_size"]
 
                 # Are we updating?
                 counter = result["counter"]
@@ -70,7 +73,9 @@ class DelayedUpdateTrainer(GenericTrainer):
                 return
 
             assert self.res_losses is not None
-            self.set_result([], losses=self.res_losses,
+            assert self.res_batch is not None
+
+            self.set_result(self.res_batch, losses=self.res_losses,
                             scalar_summaries=self.res_scal_sums,
                             histogram_summaries=self.res_hist_sums,
                             image_summaries=None)
@@ -129,7 +134,11 @@ class DelayedUpdateTrainer(GenericTrainer):
 
     @tensor
     def cumulator_counter(self) -> tf.Variable:
-        return tf.Variable(0, trainable=False, name="self.cumulator_counter")
+        return tf.Variable(0, trainable=False, name="cumulator_counter")
+
+    # @tensor
+    # def batch_counter(self) -> tf.Variable:
+    #     return tf.Variable(0, trainable=False, name="batch_counter")
     # pylint: enable=no-self-use
 
     @tensor
@@ -154,6 +163,8 @@ class DelayedUpdateTrainer(GenericTrainer):
             tf.assign_add(self.diff_buffer, self.differentiable_loss_sum))
         accumulate_ops.append(
             tf.assign_add(self.cumulator_counter, 1))
+        # accumulate_ops.append(
+        #     tf.assign_add(self.batch_counter, self.batch_size))
 
         return accumulate_ops
 
@@ -169,6 +180,7 @@ class DelayedUpdateTrainer(GenericTrainer):
 
         reset_ops.append(tf.assign(self.diff_buffer, 0.0))
         reset_ops.append(tf.assign(self.cumulator_counter, 0))
+        # reset_ops.append(tf.assign(self.batch_counter, 0))
         return reset_ops
 
     @tensor
@@ -226,3 +238,10 @@ class DelayedUpdateTrainer(GenericTrainer):
                 tf.get_collection("summary_train")),
             "histogram_summaries": tf.summary.merge(
                 tf.get_collection("summary_gradients"))}
+
+    # @property
+    # def fetches(self) -> Dict[str, tf.Tensor]:
+    #     return {"train_op": self.train_op,
+    #             "losses": self.objective_values,
+    #             "batch_size": self.batch_counter,
+    #             "_update_ops": tf.get_collection(tf.GraphKeys.UPDATE_OPS)}

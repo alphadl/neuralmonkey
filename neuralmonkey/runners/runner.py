@@ -56,7 +56,7 @@ class GreedyRunner(BaseRunner[SupportedDecoder]):
 
             image_summaries = results[0].get("image_summaries")
 
-            self.set_result(outputs=decoded_tokens,
+            self.set_result(outputs=np.array(decoded_tokens),
                             losses=[train_loss, runtime_loss],
                             scalar_summaries=None,
                             histogram_summaries=None,

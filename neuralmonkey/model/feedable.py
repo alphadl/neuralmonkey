@@ -34,8 +34,8 @@ class Feedable(metaclass=ABCMeta):
 
     @tensor
     def batch_size(self) -> tf.Tensor:
-        # TODO(tf-data) allow for arbitrarily nested dataset series
-        return tf.shape(self.dataset[next(iter(self.dataset))])[0]
+        first_tensor = tf.contrib.framework.nest.flatten(self.dataset)[0]
+        return tf.shape(first_tensor)[0]
 
     def feed_dict(self, train: bool = True) -> FeedDict:
         """Return a feed dictionary for the given feedable object.
